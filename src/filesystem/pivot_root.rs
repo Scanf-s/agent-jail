@@ -1,9 +1,12 @@
 use anyhow::{Context, Result, bail};
+use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
-use nix::unistd::{chdir, pivot_root};
-use std::fs;
-use std::path::PathBuf;
+use nix::unistd::{chdir, fchdir, pivot_root};
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 
 pub struct PivotRoot {
     pub rootfs: PathBuf,
@@ -76,23 +79,32 @@ impl PivotRoot {
     }
 
     fn pivot_root(&self) -> Result<()> {
-        // Prepare new directory to move the current root later here
-        let old_root = self.rootfs.join(".old");
-        fs::create_dir_all(&old_root).with_context(|| format!("create_dir_all {:?}", old_root))?;
+        // After pivot_root, "/" no longer reaches the old root, so keep a handle to it.
+        let old_root = open_dir_path(Path::new("/"))?;
+        // Opened after the bind mount, so the handle refers to the new mount point.
+        let new_root = open_dir_path(&self.rootfs)?;
 
-        // rootfs becomes /, previous root is relocated into /.old
-        pivot_root(self.rootfs.as_os_str(), old_root.as_path()).with_context(|| {
-            format!("pivot_root({:?}, {:?})", self.rootfs.as_os_str(), old_root)
-        })?;
+        // With "." for both arguments, the old root is stacked on top of the new root,
+        // so rootfs needs no directory to receive it.
+        fchdir(new_root.as_raw_fd()).context("fchdir to new root")?;
+        pivot_root(".", ".").context("pivot_root(\".\", \".\")")?;
 
-        // Reset CWD to the new root
+        // The kernel does not guarantee the working directory after pivot_root.
+        fchdir(old_root.as_raw_fd()).context("fchdir to old root")?;
+        umount2(".", MntFlags::MNT_DETACH).context("detach old root")?;
+
         chdir("/").context("chdir(\"/\") after pivot_root")?;
-
-        // Umount the old root
-        umount2("/.old", MntFlags::MNT_DETACH).context("umount2(/.old)")?;
-        fs::remove_dir("/.old").context("remove_dir(/.old)")?;
         Ok(())
     }
+}
+
+/// Open a directory only to refer to it, which needs no read permission.
+fn open_dir_path(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_PATH | OFlag::O_DIRECTORY).bits())
+        .open(path)
+        .with_context(|| format!("open {:?}", path))
 }
 
 #[cfg(test)]

@@ -133,7 +133,7 @@ Let's walk through the classic `chroot` + `chdir` jailbreak scenario.
 
 Because of the security problem above, modern container runtimes use the `pivot_root` system call to isolate the filesystem in a more secure way.
 
-Unlike `chroot`, which only moves the starting point of absolute path resolution, `pivot_root` swaps the kernel's idea of the root mount itself, and when combined with a new mount namespace, makes mounts inside the container invisible to the host (and vice versa). The old root is not simply discarded. It is *relocated* into a subdirectory, which we then unmount to cut the last connection to the host filesystem.
+Unlike `chroot`, which only moves the starting point of absolute path resolution, `pivot_root` swaps the kernel's idea of the root mount itself, and when combined with a new mount namespace, makes mounts inside the container invisible to the host (and vice versa). The old root is not simply discarded. `pivot_root` moves it to another location, and we then unmount it to cut the last connection to the host filesystem.
 
 The full sequence is:
 
@@ -142,10 +142,10 @@ The full sequence is:
 1. `unshare(CLONE_NEWNS)`: create a new mount namespace.
 2. `mount("/", MS_PRIVATE | MS_REC)`: stop mount events from propagating.
 3. Bind-mount the rootfs onto itself: satisfy `pivot_root`'s mount-point requirement.
-4. Create a stub directory (`rootfs/.old`) to receive the old root.
-5. `pivot_root(rootfs, rootfs/.old)`: swap the root mount.
-6. `chdir("/")`: reset the working directory into the new root.
-7. `umount2("/.old", MNT_DETACH)` + `remove_dir("/.old")`: detach and clean up.
+4. Open the old root and the new root as file descriptors.
+5. `fchdir(new_root)` + `pivot_root(".", ".")`: swap the root mount without a directory for the old root.
+6. `fchdir(old_root)` + `umount2(".", MNT_DETACH)`: detach the old root.
+7. `chdir("/")`: move the working directory into the new root.
 8. Mount a fresh `/proc` inside the container.
 
 Each step deserves a closer look.
@@ -192,48 +192,65 @@ mount::<_, _, str, str>(
 
 `MS_REC` is added defensively — if there happen to be any submounts beneath the rootfs, we want them preserved in the new view.
 
-### 4. Prepare a place for the old root
+### 4. Open both roots
 
 ```rust
-let old_root = rootfs.join(".old");
-fs::create_dir_all(&old_root)
-    .with_context(|| format!("create_dir_all {:?}", old_root))?;
+let old_root = open_dir_path(Path::new("/"))?;
+let new_root = open_dir_path(&self.rootfs)?;
+
+fn open_dir_path(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_PATH | OFlag::O_DIRECTORY).bits())
+        .open(path)
+        .with_context(|| format!("open {:?}", path))
+}
 ```
 
-`pivot_root(new_root, put_old)` does not throw away the old root — it *relocates* it into `put_old`. The kernel also requires `put_old` to be a subdirectory of `new_root`. We create `rootfs/.old` for that purpose.
+After `pivot_root`, the path `/` refers to the new root. The process can then reach the old root only through a file descriptor that it opened before the call.
+
+The new root must be opened **after** the bind mount in step 3. The kernel resolves the path again when we open it, and the last part of the path enters the bind mount. If we opened the rootfs before the bind mount, the descriptor would refer to the plain directory under the bind mount. That directory is not a mount point, so `pivot_root` would fail with `EINVAL`.
+
+Two flags matter here:
+
+- `O_PATH` opens the directory only to refer to it. The process does not need permission to read the directory.
+- `O_CLOEXEC` closes the descriptor when the process calls `exec`. The Rust standard library sets it by default. Without it, the container program would inherit a descriptor that points to the host root.
+
+`File` closes the descriptor when the value is dropped, so the function does not need explicit `close` calls.
 
 ### 5. Swap the root
 
 ```rust
-pivot_root(rootfs, old_root.as_path())
-    .with_context(|| format!("pivot_root({:?}, {:?})", rootfs, old_root))?;
+fchdir(new_root.as_raw_fd()).context("fchdir to new root")?;
+pivot_root(".", ".").context("pivot_root(\".\", \".\")")?;
 ```
 
-After this call:
+`pivot_root(new_root, put_old)` moves the old root to `put_old`, which must be `new_root` itself or a directory below it. When both arguments are `"."`, the kernel mounts the old root on top of the new root at the same place. The `pivot_root(2)` man page describes this sequence in its NOTES section, and runc, youki, and crun use it.
 
-- `/` resolves to what was `./rootfs`.
-- The previous host root is now visible at `/.old`.
+Because no directory is needed for the old root, the runtime does not write to the rootfs. This matters for a read-only rootfs, and for a rootfs that container root cannot write to inside the user namespace.
 
-The container can still reach the host filesystem via `/.old/...`, so isolation is not complete until we detach it in step 7.
+After this call, `/` is the new root. The working directory, however, still refers to the old root, so the host filesystem is still reachable until step 6.
 
-### 6. Reset the working directory
+### 6. Detach the old root
+
+```rust
+fchdir(old_root.as_raw_fd()).context("fchdir to old root")?;
+umount2(".", MntFlags::MNT_DETACH).context("detach old root")?;
+```
+
+With the current kernel, the working directory is already the old root after step 5. The kernel does not promise this, so we move there explicitly with the descriptor from step 4. runc, youki, and crun do the same.
+
+`MNT_DETACH` is a *lazy* unmount. It disconnects the old root from the mount tree immediately, but the kernel releases it only after every process stops using it. A plain `umount` would fail with `EBUSY`, because our working directory is on the old root and the runtime binary and its shared libraries were loaded from the host filesystem.
+
+There is no directory to remove after the unmount, because we never created one.
+
+### 7. Reset the working directory
 
 ```rust
 chdir("/").context("chdir(\"/\") after pivot_root")?;
 ```
 
-`pivot_root` changes the root mount but leaves the process's current working directory pointing at wherever it was before. After the pivot, that CWD now lives inside `/.old` (the relocated old root). If we skip this step, any relative path used by the child process would resolve back into the host filesystem — the same failure mode as the classic chroot escape.
-
-### 7. Detach and remove the old root
-
-```rust
-umount2("/.old", MntFlags::MNT_DETACH).context("umount2(/.old)")?;
-fs::remove_dir("/.old").context("remove_dir(/.old)")?;
-```
-
-`MNT_DETACH` is a *lazy* unmount: it disconnects `/.old` from the mount tree immediately, but defers the actual teardown until every process that still has files open on it has closed them. A plain `umount` would likely fail with `EBUSY` because the runtime binary and its shared libraries were loaded from the host filesystem.
-
-After the unmount, `/.old` is an empty directory. We use `remove_dir` (not `remove_dir_all`) so that if something went wrong and the directory still contained host files, the call would fail safely instead of deleting them.
+After step 6, the working directory still refers to the detached old root. If we skip this step, any relative path used by the child process would resolve into the host filesystem. This is the same failure as the classic chroot escape.
 
 ### 8. Mount a fresh procfs
 
@@ -248,7 +265,7 @@ mount::<_, _, _, str>(
 ).context("mount /proc")?;
 ```
 
-Detaching the old root in step 7 also severed the container's view of `/proc`. Without it, `ps`, `top`, reads under `/proc/self/*`, and many shell built-ins stop working.
+Detaching the old root in step 6 also severed the container's view of `/proc`. Without it, `ps`, `top`, reads under `/proc/self/*`, and many shell built-ins stop working.
 
 A few details are worth unpacking.
 
