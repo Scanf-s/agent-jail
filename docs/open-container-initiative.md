@@ -178,6 +178,8 @@ Initial validation should cover these points:
 - Reject NUL characters in arguments and environment entries. NUL is the zero byte used to end strings in many system calls.
 - Report unsupported terminal, mount, or namespace requests before starting setup.
 
+The container init process uses the absolute rootfs path after it enters the new user namespace. At that point, container root cannot search a directory if the directory owner is not mapped and the directory does not allow access to other users. For example, if container root maps to host UID 0 and the rootfs is under a home directory with mode `750`, the init process cannot reach the rootfs. runc and youki also bind mount and open the rootfs by its absolute path inside the init process. Document this requirement, and explain it in the error message when the rootfs cannot be reached.
+
 The first version can accept only the namespace combination and proc mount shown in the example. When a request is outside that range, return a clear error. Include the field name, for example: `process.terminal=true is not supported yet`. This is especially important for security settings that the runtime cannot yet apply.
 
 Unknown extension fields need a separate policy from known but unsupported features. Adding `deny_unknown_fields` to every object does not by itself provide full OCI compatibility.
