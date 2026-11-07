@@ -1,5 +1,5 @@
 use crate::cgroups::Cgroup;
-use crate::cli::RunArgs;
+use crate::config::ContainerConfig;
 use crate::container;
 use crate::filesystem::PivotRoot;
 use crate::ipc::StartupChannels;
@@ -12,24 +12,21 @@ use nix::unistd::{ForkResult, Gid, Pid, Uid, fork, setgid, setuid};
 use std::process::ExitCode;
 
 pub struct Runtime {
-    args: RunArgs,
+    config: ContainerConfig,
     cgroup: Cgroup,
     channels: Option<StartupChannels>,
 }
 
 impl Runtime {
-    pub fn new(args: RunArgs) -> Result<Self> {
-        // validate passed argument from CLI
-        let settings = args.validate()?;
-
+    pub fn new(config: ContainerConfig) -> Result<Self> {
         let cgroup = Cgroup::new()?;
-        cgroup.configure(&settings)?;
+        cgroup.configure(&config.resources)?;
 
         // ipc setup for the parent and the child process communication
         let channels = StartupChannels::new()?;
 
         Ok(Self {
-            args,
+            config,
             cgroup,
             channels: Some(channels),
         })
@@ -70,8 +67,8 @@ impl Runtime {
         ipc.wait_for_user_namespace()?;
         Mapping::new(
             child,
-            Uid::from_raw(self.args.uid),
-            Gid::from_raw(self.args.gid),
+            Uid::from_raw(self.config.id_mapping.host_uid),
+            Gid::from_raw(self.config.id_mapping.host_gid),
         )
         .map()
         .context("map container UID/GID")?;
@@ -125,10 +122,17 @@ impl Runtime {
 
     fn run_init(&self) -> Result<()> {
         // file system isolation
-        PivotRoot::new(self.args.rootfs.clone()).isolate_filesystem()?;
-        setgid(Gid::from_raw(0))?;
-        setuid(Uid::from_raw(0))?;
-        container::exec_cmd(&self.args.cmd, &self.args.args)
+        PivotRoot::new(self.config.rootfs.clone()).isolate_filesystem()?;
+
+        let process = &self.config.process;
+        setgid(Gid::from_raw(process.gid))?;
+        setuid(Uid::from_raw(process.uid))?;
+
+        let (cmd, args) = process
+            .args
+            .split_first()
+            .context("process.args is empty")?;
+        container::exec_cmd(cmd, args)
     }
 }
 

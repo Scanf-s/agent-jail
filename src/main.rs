@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 mod cgroups;
 mod cli;
+mod config;
 mod container;
 mod filesystem;
 mod ipc;
@@ -17,6 +18,6 @@ fn main() -> Result<ExitCode> {
 
     match cli.command {
         // Create a new container and run the requested command inside it.
-        cli::Command::Run(args) => runtime::Runtime::new(args)?.run(),
+        cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?)?.run(),
     }
 }

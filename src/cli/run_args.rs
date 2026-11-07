@@ -1,4 +1,5 @@
 use crate::cgroups::CgroupSettings;
+use crate::config::{ContainerConfig, IdMapping, ProcessConfig};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::num::NonZeroU64;
@@ -38,7 +39,30 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    pub fn validate(&self) -> Result<CgroupSettings> {
+    /// Validate the CLI input and convert it into the runtime configuration.
+    pub fn into_config(self) -> Result<ContainerConfig> {
+        let resources = self.validate()?;
+
+        let mut args = Vec::with_capacity(self.args.len() + 1);
+        args.push(self.cmd);
+        args.extend(self.args);
+
+        Ok(ContainerConfig {
+            rootfs: self.rootfs,
+            process: ProcessConfig {
+                args,
+                uid: 0,
+                gid: 0,
+            },
+            id_mapping: IdMapping {
+                host_uid: self.uid,
+                host_gid: self.gid,
+            },
+            resources,
+        })
+    }
+
+    fn validate(&self) -> Result<CgroupSettings> {
         if !self.rootfs.is_dir() {
             bail!(
                 "rootfs {:?} does not exist or is not a directory",
@@ -88,5 +112,26 @@ mod tests {
             args.cpus = cpus;
             assert!(args.validate().is_err(), "accepted {cpus}");
         }
+    }
+
+    #[test]
+    fn converts_cli_input_into_container_config() {
+        let args = RunArgs {
+            rootfs: PathBuf::from("."),
+            cpus: 1.0,
+            mem: 1,
+            pids: 1,
+            uid: 1000,
+            gid: 1001,
+            cmd: String::from("/bin/sh"),
+            args: vec![String::from("-c"), String::from("echo hello")],
+        };
+
+        let config = args.into_config().unwrap();
+        assert_eq!(config.rootfs, PathBuf::from("."));
+        assert_eq!(config.process.args, ["/bin/sh", "-c", "echo hello"]);
+        assert_eq!((config.process.uid, config.process.gid), (0, 0));
+        assert_eq!(config.id_mapping.host_uid, 1000);
+        assert_eq!(config.id_mapping.host_gid, 1001);
     }
 }
