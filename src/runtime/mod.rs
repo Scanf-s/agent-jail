@@ -1,7 +1,7 @@
 use crate::cgroups::{self, Cgroup};
 use crate::config::ContainerConfig;
 use crate::container;
-use crate::filesystem::PivotRoot;
+use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::StartupChannels;
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
@@ -15,6 +15,7 @@ pub struct Runtime {
     config: ContainerConfig,
     mapping: Mapping,
     cgroup: Cgroup,
+    run_dir: RunDir,
     channels: Option<StartupChannels>,
 }
 
@@ -24,6 +25,7 @@ impl Runtime {
         let delegated = cgroups::enter_delegated_cgroup()?;
         let cgroup = Cgroup::new(&delegated)?;
         cgroup.configure(&config.resources)?;
+        let run_dir = RunDir::create()?;
 
         // ipc setup for the parent and the child process communication
         let channels = StartupChannels::new()?;
@@ -32,6 +34,7 @@ impl Runtime {
             config,
             mapping,
             cgroup,
+            run_dir,
             channels: Some(channels),
         })
     }
@@ -44,6 +47,15 @@ impl Runtime {
     }
 
     fn run_parent(&mut self, child: Pid) -> Result<ExitCode> {
+        let result = self.wait_for_container(child);
+        // The setup process removes the run directory. This covers a run that fails before that.
+        if let Err(error) = self.run_dir.remove() {
+            eprintln!("aj: warning: {error:#}");
+        }
+        result
+    }
+
+    fn wait_for_container(&mut self, child: Pid) -> Result<ExitCode> {
         if let Err(error) = self.setup_parent(child) {
             let _ = kill(child, Signal::SIGKILL);
             let _ = waitpid(child, None);
@@ -108,6 +120,11 @@ impl Runtime {
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
                 let status = waitpid(child, None).context("waitpid(child) failed")?;
+                // Only a process in the user namespace can remove files of subordinate IDs.
+                // The overlay is already gone, because init's mount namespace ended with it.
+                if let Err(error) = self.run_dir.remove() {
+                    eprintln!("aj: warning: {error:#}");
+                }
                 std::process::exit(i32::from(exit_status(status)?));
             }
             ForkResult::Child => {
@@ -122,7 +139,7 @@ impl Runtime {
 
     fn run_init(&self) -> Result<()> {
         // file system isolation
-        PivotRoot::new(self.config.rootfs.clone()).isolate_filesystem()?;
+        PivotRoot::new(self.config.rootfs.clone(), &self.run_dir).isolate_filesystem()?;
 
         let process = &self.config.process;
         chdir(&process.cwd)
