@@ -26,22 +26,21 @@ fn check_delegated_controllers(delegated: &str) -> Result<()> {
     Ok(())
 }
 
+// Resource limits for the container's cgroup.
 pub struct CgroupSettings {
-    cpu_quota_us: NonZeroU64,
-    memory_max: u64,
-    pids_max: u64,
+    pub cpu: Option<CpuMax>,
+    pub memory_max: Option<u64>,
+    pub pids_max: Option<u64>,
 }
 
-impl CgroupSettings {
-    pub const CPU_PERIOD_US: u64 = 100_000;
+// CPU time the cgroup may use, in microseconds, within each period.
+pub struct CpuMax {
+    pub quota_us: NonZeroU64,
+    pub period_us: u64,
+}
 
-    pub fn new(cpu_quota_us: NonZeroU64, memory_max: u64, pids_max: u64) -> Self {
-        Self {
-            cpu_quota_us,
-            memory_max,
-            pids_max,
-        }
-    }
+impl CpuMax {
+    pub const DEFAULT_PERIOD_US: u64 = 100_000; // 100ms
 }
 
 pub struct Cgroup {
@@ -101,9 +100,16 @@ impl Cgroup {
     }
 
     pub fn configure(&self, settings: &CgroupSettings) -> Result<()> {
-        self.set_cpu_max(settings.cpu_quota_us.get(), CgroupSettings::CPU_PERIOD_US)?;
-        self.set_memory_max(settings.memory_max)?;
-        self.set_pids_max(settings.pids_max)
+        if let Some(cpu) = &settings.cpu {
+            self.set_cpu_max(cpu.quota_us.get(), cpu.period_us)?;
+        }
+        if let Some(bytes) = settings.memory_max {
+            self.set_memory_max(bytes)?;
+        }
+        if let Some(pids) = settings.pids_max {
+            self.set_pids_max(pids)?;
+        }
+        Ok(())
     }
 
     pub fn add_pid(&self, pid: nix::unistd::Pid) -> Result<()> {
@@ -196,7 +202,14 @@ mod tests {
         fs::create_dir(&path).unwrap();
         let cgroup = Cgroup { path: path.clone() };
 
-        let settings = CgroupSettings::new(NonZeroU64::new(50_000).unwrap(), 512 * 1024 * 1024, 64);
+        let settings = CgroupSettings {
+            cpu: Some(CpuMax {
+                quota_us: NonZeroU64::new(5_000).unwrap(),
+                period_us: 10_000,
+            }),
+            memory_max: Some(512 * 1024 * 1024),
+            pids_max: Some(64),
+        };
         cgroup.add_pid(Pid::from_raw(1234)).unwrap();
         cgroup.configure(&settings).unwrap();
 
@@ -210,7 +223,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(path.join("cpu.max")).unwrap(),
-            "50000 100000"
+            "5000 10000"
         );
         assert_eq!(fs::read_to_string(path.join("pids.max")).unwrap(), "64");
 
@@ -219,6 +232,24 @@ mod tests {
         }
         drop(cgroup);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn leaves_unspecified_limits_unwritten() {
+        let temp = TempDir::new();
+        let cgroup = Cgroup {
+            path: temp.0.clone(),
+        };
+        let settings = CgroupSettings {
+            cpu: None,
+            memory_max: None,
+            pids_max: Some(64),
+        };
+        cgroup.configure(&settings).unwrap();
+
+        assert!(!temp.0.join("cpu.max").exists());
+        assert!(!temp.0.join("memory.max").exists());
+        assert_eq!(fs::read_to_string(temp.0.join("pids.max")).unwrap(), "64");
     }
 
     #[test]

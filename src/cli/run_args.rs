@@ -1,4 +1,4 @@
-use crate::cgroups::CgroupSettings;
+use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, IdMapping, ProcessConfig};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -82,11 +82,18 @@ impl RunArgs {
             );
         }
 
-        let cpu_quota_us = (self.cpus * CgroupSettings::CPU_PERIOD_US as f64) as u64;
+        let cpu_quota_us = (self.cpus * CpuMax::DEFAULT_PERIOD_US as f64) as u64;
         let cpu_quota_us =
             NonZeroU64::new(cpu_quota_us).context("--cpus is too small for a nonzero CPU quota")?;
 
-        Ok(CgroupSettings::new(cpu_quota_us, self.mem, self.pids))
+        Ok(CgroupSettings {
+            cpu: Some(CpuMax {
+                quota_us: cpu_quota_us,
+                period_us: CpuMax::DEFAULT_PERIOD_US,
+            }),
+            memory_max: Some(self.mem),
+            pids_max: Some(self.pids),
+        })
     }
 }
 
