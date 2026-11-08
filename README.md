@@ -51,9 +51,3 @@ The Makefile only holds formatting and linting targets.
 make fmt    # cargo fmt
 make lint   # cargo clippy --all-features
 ```
-
-## Documentation
-
-- [Verify the isolation](docs/verification.md): commands and example screenshots.
-- [Learning notes](docs/README.md): system calls, filesystems, namespaces, cgroups, and user mapping.
-- [OCI implementation guide](docs/open-container-initiative.md): OCI concepts, staged implementation, lifecycle design, and verification.
