@@ -7,6 +7,17 @@ pub struct ContainerConfig {
     pub rootfs: PathBuf,
     pub process: ProcessConfig,
     pub resources: CgroupSettings,
+    pub volumes: Vec<Volume>,
+}
+
+/// A host file or directory that the container sees at `destination`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Volume {
+    /// Absolute host path without symbolic links.
+    pub source: PathBuf,
+    /// Absolute path inside the container.
+    pub destination: PathBuf,
+    pub read_only: bool,
 }
 
 /// The program to run inside the container.

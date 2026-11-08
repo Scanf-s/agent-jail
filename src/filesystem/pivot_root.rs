@@ -1,5 +1,7 @@
 use super::RunDir;
 use super::dev::prepare_dev;
+use super::volume::{attach_volumes, detach_volumes};
+use crate::config::Volume;
 use anyhow::{Context, Result, bail, ensure};
 use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
@@ -18,15 +20,17 @@ pub struct PivotRoot {
     work: PathBuf,
     /// The overlay mount point, which becomes the new root.
     merged: PathBuf,
+    volumes: Vec<Volume>,
 }
 
 impl PivotRoot {
-    pub fn new(rootfs: PathBuf, run_dir: &RunDir) -> Self {
+    pub fn new(rootfs: PathBuf, run_dir: &RunDir, volumes: &[Volume]) -> Self {
         Self {
             rootfs,
             upper: run_dir.upper(),
             work: run_dir.work(),
             merged: run_dir.merged(),
+            volumes: volumes.to_vec(),
         }
     }
 
@@ -43,11 +47,13 @@ impl PivotRoot {
         // Mount necessary virtual filesystems
         self.mount_proc()?;
         prepare_dev(&self.merged)?;
+        // Host paths are visible only before pivot_root, and destinations must be resolved
+        // only after it.
+        let volumes = detach_volumes(&self.volumes)?;
 
         // Isolate filesystem with new configured mount table using pivot_root
         self.pivot_root()?;
-
-        Ok(())
+        attach_volumes(volumes)
     }
 
     fn mount_overlay(&self) -> Result<()> {
@@ -174,6 +180,7 @@ mod tests {
             upper: PathBuf::from("/nonexistent/upper"),
             work: PathBuf::from("/nonexistent/work"),
             merged: PathBuf::from("/nonexistent/merged"),
+            volumes: Vec::new(),
         }
     }
 

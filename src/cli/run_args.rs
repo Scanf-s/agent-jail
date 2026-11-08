@@ -1,3 +1,4 @@
+use super::volume_arg::{default_workdir, parse_volume};
 use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, ProcessConfig};
 use crate::paths;
@@ -24,6 +25,15 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 1024)]
     pub pids: u64,
 
+    /// Bind mount a host file or directory. CONTAINER defaults to the host path. Repeatable.
+    #[arg(short = 'v', long = "volume", value_name = "HOST[:CONTAINER][:ro]")]
+    pub volumes: Vec<String>,
+
+    /// Working directory inside the container [default: the current directory if a volume
+    /// contains it, else /].
+    #[arg(short = 'w', long)]
+    pub workdir: Option<PathBuf>,
+
     /// Command to execute inside the container.
     pub cmd: String,
 
@@ -37,6 +47,24 @@ impl RunArgs {
     pub fn into_config(self) -> Result<ContainerConfig> {
         let resources = self.validate()?;
         let rootfs = resolve_rootfs(self.rootfs)?;
+        let volumes = self
+            .volumes
+            .iter()
+            .map(|spec| parse_volume(spec))
+            .collect::<Result<Vec<_>>>()?;
+        let cwd = match self.workdir {
+            Some(workdir) => {
+                ensure!(
+                    workdir.is_absolute(),
+                    "--workdir must be an absolute path inside the container but got {workdir:?}"
+                );
+                workdir
+            }
+            None => {
+                let host_cwd = std::env::current_dir().context("read the current directory")?;
+                default_workdir(&host_cwd, &volumes)
+            }
+        };
 
         let mut args = Vec::with_capacity(self.args.len() + 1);
         args.push(self.cmd);
@@ -52,13 +80,13 @@ impl RunArgs {
                         format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
                     })
                     .collect(),
-                // pivot_root already leaves the process at the new root.
-                cwd: PathBuf::from("/"),
+                cwd,
                 uid: 0,
                 gid: 0,
                 additional_gids: Vec::new(),
             },
             resources,
+            volumes,
         })
     }
 
@@ -117,6 +145,8 @@ mod tests {
             cpus: 1.0,
             mem: 1,
             pids: 1,
+            volumes: Vec::new(),
+            workdir: None,
             cmd: String::from("true"),
             args: Vec::new(),
         };
@@ -135,6 +165,8 @@ mod tests {
             cpus: 1.0,
             mem: 1,
             pids: 1,
+            volumes: Vec::new(),
+            workdir: None,
             cmd: String::from("/bin/sh"),
             args: vec![String::from("-c"), String::from("echo hello")],
         };

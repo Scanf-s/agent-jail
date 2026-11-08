@@ -139,7 +139,12 @@ impl Runtime {
 
     fn run_init(&self) -> Result<()> {
         // file system isolation
-        PivotRoot::new(self.config.rootfs.clone(), &self.run_dir).isolate_filesystem()?;
+        PivotRoot::new(
+            self.config.rootfs.clone(),
+            &self.run_dir,
+            &self.config.volumes,
+        )
+        .isolate_filesystem()?;
 
         let process = &self.config.process;
         chdir(&process.cwd)

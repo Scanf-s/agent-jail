@@ -59,6 +59,7 @@ impl Bundle {
             rootfs,
             process,
             resources,
+            volumes: Vec::new(),
         })
     }
 }
