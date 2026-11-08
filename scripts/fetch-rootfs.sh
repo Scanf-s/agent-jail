@@ -17,7 +17,7 @@ mkdir -p "$ROOTFS_DIR"
 echo "fetching $URL"
 
 # --no-same-owner: Forces extracted files to be owned by the user running the command (host: me, container: root)
-# --no-same-permissions: Disregard permissions from the archive, applying the user's umask to the new files
-# umask: Default file/directory permission masking value (default value: 022)
-curl -fsSL "$URL" | tar -xz --no-same-owner --no-same-permissions -C "$ROOTFS_DIR"
+# --same-permissions: Keep the permissions in the archive instead of applying the user's umask (default value: 022),
+#   so that /tmp keeps the sticky bit and stays writable for every user (1777)
+curl -fsSL "$URL" | tar -xz --no-same-owner --same-permissions -C "$ROOTFS_DIR"
 echo "extracted alpine-minirootfs to $ROOTFS_DIR"
