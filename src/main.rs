@@ -1,5 +1,6 @@
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use clap::Parser;
+use nix::unistd::Uid;
 use std::process::ExitCode;
 
 mod cgroups;
@@ -16,6 +17,12 @@ mod user;
 fn main() -> Result<ExitCode> {
     // Parse the CLI arguments.
     let cli = cli::Cli::parse();
+
+    // The cgroup setup needs a cgroup that systemd delegates to a normal user.
+    ensure!(
+        !Uid::effective().is_root(),
+        "container-runtime does not run as root; run it as a normal user without sudo"
+    );
 
     match cli.command {
         // Create a new container and run the requested command inside it.
