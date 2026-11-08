@@ -8,6 +8,7 @@ mod config;
 mod container;
 mod filesystem;
 mod ipc;
+mod oci;
 mod runtime;
 mod user;
 
