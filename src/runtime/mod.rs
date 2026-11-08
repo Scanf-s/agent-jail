@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Gid, Pid, Uid, fork, setgid, setuid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setuid};
 use std::process::ExitCode;
 
 pub struct Runtime {
@@ -125,14 +125,12 @@ impl Runtime {
         PivotRoot::new(self.config.rootfs.clone()).isolate_filesystem()?;
 
         let process = &self.config.process;
+        chdir(&process.cwd)
+            .with_context(|| format!("chdir to working directory {}", process.cwd.display()))?;
         setgid(Gid::from_raw(process.gid))?;
         setuid(Uid::from_raw(process.uid))?;
 
-        let (cmd, args) = process
-            .args
-            .split_first()
-            .context("process.args is empty")?;
-        container::exec_cmd(cmd, args)
+        container::exec(&process.args, &process.env)
     }
 }
 

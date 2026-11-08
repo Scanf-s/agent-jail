@@ -1,22 +1,24 @@
 use anyhow::{Context, Result};
-use nix::unistd::execvp;
+use nix::unistd::execvpe;
 use std::ffi::CString;
 
-/// Replace the current process with `cmd` + `args` via `execvp`.
+/// Replace the current process with `args[0]`, passing `args` as argv and `env` as the environment.
 /// Returns only on failure.
-pub fn exec_cmd(cmd: &str, args: &[String]) -> Result<()> {
-    // Convert the command name into a nul-safe CString.
-    let c_cmd = CString::new(cmd).context("cmd contains a nul byte")?;
+///
+/// A program name without '/' is searched in the runtime's own PATH, not in the PATH from `env`,
+/// because libc's execvpe reads PATH from the calling process.
+pub fn exec(args: &[String], env: &[String]) -> Result<()> {
+    let program = args.first().context("no program to execute")?;
+    let c_args = to_cstrings(args).context("argument contains a nul byte")?;
+    let c_env = to_cstrings(env).context("environment variable contains a nul byte")?;
 
-    // Convert the arguments into nul-safe CStrings.
-    let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
-    c_args.push(c_cmd.clone()); // argv[0] — conventionally the program name
-    for arg in args {
-        c_args.push(CString::new(arg.as_str()).context("arg contains a nul byte")?);
-    }
+    let Err(error) = execvpe(&c_args[0], &c_args, &c_env);
+    Err(error).with_context(|| format!("exec {program:?}"))
+}
 
-    // Replace the current process image with the target program.
-    execvp(&c_cmd, &c_args).with_context(|| format!("exec {:?}", cmd))?;
-
-    unreachable!("failed to execute: {} {}", cmd, args.join(" "));
+fn to_cstrings(values: &[String]) -> Result<Vec<CString>, std::ffi::NulError> {
+    values
+        .iter()
+        .map(|value| CString::new(value.as_str()))
+        .collect()
 }

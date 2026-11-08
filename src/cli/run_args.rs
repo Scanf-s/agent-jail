@@ -51,6 +51,14 @@ impl RunArgs {
             rootfs: self.rootfs,
             process: ProcessConfig {
                 args,
+                // Pass the runtime's own environment so that `run` keeps inheriting it.
+                env: std::env::vars_os()
+                    .map(|(key, value)| {
+                        format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
+                    })
+                    .collect(),
+                // pivot_root already leaves the process at the new root.
+                cwd: PathBuf::from("/"),
                 uid: 0,
                 gid: 0,
             },
@@ -137,6 +145,8 @@ mod tests {
         let config = args.into_config().unwrap();
         assert_eq!(config.rootfs, PathBuf::from("."));
         assert_eq!(config.process.args, ["/bin/sh", "-c", "echo hello"]);
+        assert_eq!(config.process.env.len(), std::env::vars_os().count());
+        assert_eq!(config.process.cwd, PathBuf::from("/"));
         assert_eq!((config.process.uid, config.process.gid), (0, 0));
         assert_eq!(config.id_mapping.host_uid, 1000);
         assert_eq!(config.id_mapping.host_gid, 1001);
