@@ -1,29 +1,55 @@
 use anyhow::{Context, Result, bail};
+use nix::unistd::{AccessFlags, Pid, access};
 use rand::random;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const REQUIRED_CONTROLLERS: [&str; 3] = ["memory", "cpu", "pids"];
+// The runtime moves itself here so that the delegated cgroup holds no process.
+const RUNTIME_LEAF: &str = "runtime";
 
-fn missing_controllers(active: &str) -> Vec<&'static str> {
-    let active: Vec<&str> = active.split_whitespace().collect();
-    REQUIRED_CONTROLLERS
-        .into_iter()
-        .filter(|controller| !active.contains(controller))
-        .collect()
-}
-
-fn check_delegated_controllers(delegated: &str) -> Result<()> {
-    let delegated: Vec<&str> = delegated.split_whitespace().collect();
+fn check_controllers(available: &str) -> Result<()> {
+    let available: Vec<&str> = available.split_whitespace().collect();
     for controller in REQUIRED_CONTROLLERS {
-        if !delegated.contains(&controller) {
-            bail!(
-                "controller {controller} not delegated to new cgroup (check parent's cgroup.subtree_control)"
-            );
+        if !available.contains(&controller) {
+            bail!("controller {controller} is not available");
         }
     }
     Ok(())
+}
+
+/// Return the path of the cgroup v2 entry (`0::<path>`) in `/proc/<pid>/cgroup`,
+/// relative to the cgroup root.
+fn unified_cgroup_path(proc_cgroup: &str) -> Result<PathBuf> {
+    proc_cgroup
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| PathBuf::from(path.trim_start_matches('/')))
+        .context("no cgroup v2 entry in /proc/self/cgroup")
+}
+
+/// Check that the runtime can create the container cgroup under `dir`.
+///
+/// `dir` must be writable by this user and must hold no other process, because a cgroup that
+/// holds processes cannot pass controllers to its children.
+fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
+    access(&dir.join("cgroup.subtree_control"), AccessFlags::W_OK)
+        .with_context(|| format!("cgroup {dir:?} is not delegated to this user"))?;
+
+    let procs = fs::read_to_string(dir.join("cgroup.procs"))
+        .with_context(|| format!("read {dir:?}/cgroup.procs"))?;
+    if procs
+        .split_whitespace()
+        .any(|pid| pid != runtime.to_string())
+    {
+        bail!("cgroup {dir:?} holds processes other than the runtime");
+    }
+
+    let available = fs::read_to_string(dir.join("cgroup.controllers"))
+        .with_context(|| format!("read {dir:?}/cgroup.controllers"))?;
+    check_controllers(&available).with_context(|| format!("cgroup {dir:?}"))
 }
 
 // Resource limits for the container's cgroup.
@@ -48,53 +74,45 @@ pub struct Cgroup {
 }
 
 impl Cgroup {
-    // Create a new cgroup for the container.
+    /// Create the container cgroup inside the delegated cgroup that the runtime runs in.
     pub fn new() -> Result<Self> {
-        // controllers = resources
-        let cgroup_path: &Path = Path::new("/sys/fs/cgroup");
-        let subtree_path: &Path = Path::new("/sys/fs/cgroup/cgroup.subtree_control");
-
-        // Check that cgroupfs is mounted as v2.
-        let v2_marker = cgroup_path.join("cgroup.controllers");
-        if !v2_marker.is_file() {
+        let root = Path::new(CGROUP_ROOT);
+        if !root.join("cgroup.controllers").is_file() {
             bail!("cgroupfs is not v2 (or not mounted)");
         }
 
-        // cgroup operations require root privileges.
-        if !nix::unistd::geteuid().is_root() {
-            bail!("cgroup operations require root privileges");
-        }
-
-        // Check whether subtree_control delegates the memory, cpu, and pids controllers to children.
-        let controllers: String = fs::read_to_string(subtree_path)?;
-        let missing_controllers = missing_controllers(&controllers);
-
-        // Enable any missing controllers on the parent cgroup.
-        if !missing_controllers.is_empty() {
-            let payload = missing_controllers
-                .iter()
-                .map(|c| format!("+{}", c))
-                .collect::<Vec<_>>()
-                .join(" ");
-            fs::write(subtree_path, payload).context("failed to enable controllers")?;
-        }
-
-        Self::create_cgroup_dir(cgroup_path)
+        let own = fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
+        let delegated = root.join(unified_cgroup_path(&own)?);
+        Self::create_in(&delegated, Pid::this())
     }
 
-    fn create_cgroup_dir(cgroup_path: &Path) -> Result<Self> {
-        // Create a new cgroup subdirectory for this container.
-        let id = format!("rust_container_{:x}", random::<u64>());
-        let new_container_cgroup = cgroup_path.join(&id);
-        fs::create_dir(&new_container_cgroup).context("create cgroup dir")?;
-        let cgroup = Cgroup {
-            path: new_container_cgroup,
-        };
+    fn create_in(delegated: &Path, runtime: Pid) -> Result<Self> {
+        check_delegated(delegated, runtime)?;
 
-        // Verify the required controllers were delegated to the new cgroup.
-        let delegated = fs::read_to_string(cgroup.path.join("cgroup.controllers"))
+        let leaf = delegated.join(RUNTIME_LEAF);
+        fs::create_dir(&leaf).with_context(|| format!("create {leaf:?}"))?;
+        fs::write(leaf.join("cgroup.procs"), runtime.to_string())
+            .with_context(|| format!("move the runtime into {leaf:?}"))?;
+
+        fs::write(
+            delegated.join("cgroup.subtree_control"),
+            "+cpu +memory +pids",
+        )
+        .with_context(|| format!("enable controllers in {delegated:?}"))?;
+
+        Self::create_cgroup_dir(delegated)
+    }
+
+    fn create_cgroup_dir(parent: &Path) -> Result<Self> {
+        let id = format!("rust_container_{:x}", random::<u64>());
+        let path = parent.join(&id);
+        fs::create_dir(&path).context("create cgroup dir")?;
+        // From here on, Drop removes the directory if a later check fails.
+        let cgroup = Cgroup { path };
+
+        let available = fs::read_to_string(cgroup.path.join("cgroup.controllers"))
             .context("read new cgroup.controllers")?;
-        check_delegated_controllers(&delegated)?;
+        check_controllers(&available).context("new container cgroup")?;
 
         Ok(cgroup)
     }
@@ -144,7 +162,7 @@ impl Drop for Cgroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::unistd::Pid;
+    use std::os::unix::fs::PermissionsExt;
 
     struct TempDir(PathBuf);
 
@@ -163,21 +181,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finds_only_missing_controllers_in_required_order() {
-        assert_eq!(missing_controllers("cpu io\npids"), vec!["memory"]);
-        assert_eq!(
-            missing_controllers("memory cpu pids io"),
-            Vec::<&str>::new()
-        );
-        assert_eq!(missing_controllers("memoryful cpu"), vec!["memory", "pids"]);
+    /// A directory laid out like a delegated cgroup that holds only `runtime`.
+    fn delegated_dir(runtime: Pid) -> TempDir {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("cgroup.subtree_control"), "").unwrap();
+        fs::write(temp.0.join("cgroup.procs"), format!("{runtime}\n")).unwrap();
+        fs::write(temp.0.join("cgroup.controllers"), "cpu memory pids\n").unwrap();
+        temp
     }
 
     #[test]
-    fn rejects_a_missing_delegated_controller() {
-        assert!(check_delegated_controllers("cpu memory pids io").is_ok());
-        let error = check_delegated_controllers("cpu memory").unwrap_err();
-        assert!(error.to_string().contains("controller pids not delegated"));
+    fn reads_the_unified_cgroup_path() {
+        let path = unified_cgroup_path("0::/user.slice/run-1.scope\n").unwrap();
+        assert_eq!(path, PathBuf::from("user.slice/run-1.scope"));
+
+        let hybrid = "1:name=systemd:/other\n0::/app.slice\n";
+        assert_eq!(
+            unified_cgroup_path(hybrid).unwrap(),
+            PathBuf::from("app.slice")
+        );
+
+        assert!(unified_cgroup_path("1:name=systemd:/other\n").is_err());
+    }
+
+    #[test]
+    fn rejects_a_missing_controller() {
+        assert!(check_controllers("cpu memory pids io").is_ok());
+        let error = check_controllers("cpu memoryful").unwrap_err();
+        assert!(error.to_string().contains("controller memory"), "{error:#}");
+    }
+
+    #[test]
+    fn accepts_a_delegated_cgroup_that_holds_only_the_runtime() {
+        let runtime = Pid::from_raw(1234);
+        let temp = delegated_dir(runtime);
+        check_delegated(&temp.0, runtime).unwrap();
+    }
+
+    #[test]
+    fn rejects_a_cgroup_that_holds_other_processes() {
+        let runtime = Pid::from_raw(1234);
+        let temp = delegated_dir(runtime);
+        fs::write(temp.0.join("cgroup.procs"), "1234\n5678\n").unwrap();
+        let error = check_delegated(&temp.0, runtime).unwrap_err();
+        assert!(error.to_string().contains("holds processes"), "{error:#}");
+    }
+
+    #[test]
+    fn rejects_a_cgroup_without_required_controllers() {
+        let runtime = Pid::from_raw(1234);
+        let temp = delegated_dir(runtime);
+        fs::write(temp.0.join("cgroup.controllers"), "cpu memory\n").unwrap();
+        let error = check_delegated(&temp.0, runtime).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("controller pids"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_cgroup_that_this_user_cannot_write() {
+        // Root bypasses file permissions, so this case cannot be reproduced.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let runtime = Pid::from_raw(1234);
+        let temp = delegated_dir(runtime);
+        let control = temp.0.join("cgroup.subtree_control");
+        fs::set_permissions(&control, fs::Permissions::from_mode(0o444)).unwrap();
+        let error = check_delegated(&temp.0, runtime).unwrap_err();
+        assert!(error.to_string().contains("not delegated"), "{error:#}");
+    }
+
+    #[test]
+    fn moves_the_runtime_out_before_enabling_controllers() {
+        let runtime = Pid::from_raw(1234);
+        let temp = delegated_dir(runtime);
+
+        // A plain directory has no cgroup.controllers in the new child, so creation stops there.
+        let error = Cgroup::create_in(&temp.0, runtime).err().unwrap();
+        assert!(error.to_string().contains("read new cgroup.controllers"));
+
+        let leaf = temp.0.join(RUNTIME_LEAF);
+        assert_eq!(
+            fs::read_to_string(leaf.join("cgroup.procs")).unwrap(),
+            "1234"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.0.join("cgroup.subtree_control")).unwrap(),
+            "+cpu +memory +pids"
+        );
     }
 
     #[test]
