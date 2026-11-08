@@ -1,4 +1,5 @@
 use super::RunDir;
+use super::dev::prepare_dev;
 use anyhow::{Context, Result, bail, ensure};
 use nix::fcntl::OFlag;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
@@ -41,6 +42,7 @@ impl PivotRoot {
 
         // Mount necessary virtual filesystems
         self.mount_proc()?;
+        prepare_dev(&self.merged)?;
 
         // Isolate filesystem with new configured mount table using pivot_root
         self.pivot_root()?;
