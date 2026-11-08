@@ -13,12 +13,15 @@ use std::process::ExitCode;
 
 pub struct Runtime {
     config: ContainerConfig,
+    mapping: Mapping,
     cgroup: Cgroup,
     channels: Option<StartupChannels>,
 }
 
 impl Runtime {
     pub fn new(config: ContainerConfig) -> Result<Self> {
+        let mapping = Mapping::for_current_user()?;
+
         // This may replace the process, so it runs before the runtime opens any resource.
         let delegated = cgroups::enter_delegated_cgroup()?;
         let cgroup = Cgroup::new(&delegated)?;
@@ -29,6 +32,7 @@ impl Runtime {
 
         Ok(Self {
             config,
+            mapping,
             cgroup,
             channels: Some(channels),
         })
@@ -66,11 +70,10 @@ impl Runtime {
         ipc.signal_cgroup_ready()?;
 
         // UID/GID maps can be written after the child creates its user namespace.
-        // Without privilege, the kernel lets the runtime map only its own IDs.
         ipc.wait_for_user_namespace()?;
-        Mapping::new(child, Uid::effective(), Gid::effective())
-            .map()
-            .context("map container UID/GID")?;
+        self.mapping
+            .apply(child)
+            .context("map container UIDs and GIDs")?;
         ipc.signal_mapping_ready()?;
         Ok(())
     }
