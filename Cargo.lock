@@ -173,6 +173,7 @@ dependencies = [
  "num_cpus",
  "oci-spec",
  "rand",
+ "serde_json",
 ]
 
 [[package]]

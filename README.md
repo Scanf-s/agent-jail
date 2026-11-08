@@ -43,6 +43,31 @@ Two notes about this command:
 - Avoid `sudo cargo run` when you installed Rust with `rustup`. The root PATH usually does not include `~/.cargo/bin`, so the command fails. Build first, then run the produced binary with `sudo`.
 - `--uid` and `--gid` set the host user that container root maps to. `$(id -u)` and `$(id -g)` map it to yourself, so files created inside the container stay writable for you.
 
+### Run an OCI bundle
+
+The `run-bundle` command reads `config.json` from a bundle directory and runs its program. It waits until the program finishes, like `run`.
+
+1. Fetch the rootfs into the example bundle.
+
+```bash
+./scripts/fetch-rootfs.sh ./examples/oci-bundle/rootfs
+```
+
+2. Run the example bundle with `sudo`.
+
+```bash
+sudo ./target/release/container-runtime run-bundle ./examples/oci-bundle
+```
+
+The program prints `OCI_STARTED`, its working directory, its user, and its environment. The environment contains only the entries in `process.env`.
+
+Notes about bundles:
+
+- The runtime supports only part of the OCI runtime specification 1.3.0. If `config.json` requests a setting that the runtime cannot apply, the command fails before it creates the container, and the error names the field. Unknown fields are ignored.
+- `process.args[0]` must be an absolute path.
+- The example maps container root to host UID and GID 1000, like `--uid` and `--gid` in the `run` example. If `id -u` or `id -g` prints another value, change `hostID` in `linux.uidMappings` and `linux.gidMappings`.
+- Container init reaches the rootfs from inside the new user namespace. If container root maps to a host user that cannot search every directory above the rootfs, the command fails. For example, this happens when container root maps to host root and the rootfs is under a home directory with mode `750`.
+
 ### Development commands
 
 The Makefile only holds formatting and linting targets.

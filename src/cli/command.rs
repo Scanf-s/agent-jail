@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use super::RunArgs;
 
@@ -20,17 +21,33 @@ pub struct Cli {
 pub enum Command {
     /// Run a command inside an isolated rootfs.
     Run(RunArgs),
+    /// Run the program described by an OCI bundle.
+    RunBundle {
+        /// Path to the bundle directory that contains config.json.
+        bundle: PathBuf,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn run_args(args: &[&str]) -> RunArgs {
         let cli = Cli::try_parse_from(args).unwrap();
-        let Command::Run(run) = cli.command;
+        let Command::Run(run) = cli.command else {
+            panic!("expected the run command");
+        };
         run
+    }
+
+    #[test]
+    fn parses_run_bundle() {
+        let cli = Cli::try_parse_from(["container-runtime", "run-bundle", "./bundle"]).unwrap();
+        let Command::RunBundle { bundle } = cli.command else {
+            panic!("expected the run-bundle command");
+        };
+        assert_eq!(bundle, PathBuf::from("./bundle"));
+        assert!(Cli::try_parse_from(["container-runtime", "run-bundle"]).is_err());
     }
 
     #[test]

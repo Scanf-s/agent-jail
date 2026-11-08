@@ -20,5 +20,10 @@ fn main() -> Result<ExitCode> {
     match cli.command {
         // Create a new container and run the requested command inside it.
         cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?)?.run(),
+        // Validate the whole configuration before Runtime::new creates a cgroup.
+        cli::Command::RunBundle { bundle } => {
+            let config = oci::Bundle::load(&bundle)?.into_config()?;
+            runtime::Runtime::new(config)?.run()
+        }
     }
 }
