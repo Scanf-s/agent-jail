@@ -78,7 +78,7 @@ impl Runtime {
 
     fn run_setup_process(&mut self) -> ! {
         if let Err(error) = self.setup_process() {
-            eprintln!("container-runtime: setup process failed: {error:#}");
+            eprintln!("agent-jail: setup process failed: {error:#}");
             std::process::exit(127);
         }
         unreachable!("setup process returned without exiting");
@@ -112,7 +112,7 @@ impl Runtime {
             }
             ForkResult::Child => {
                 if let Err(error) = self.run_init() {
-                    eprintln!("container-runtime: container init failed: {error:#}");
+                    eprintln!("agent-jail: container init failed: {error:#}");
                     std::process::exit(127);
                 }
                 unreachable!("container init returned without executing command");

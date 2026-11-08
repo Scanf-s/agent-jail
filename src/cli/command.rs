@@ -6,9 +6,9 @@ use super::RunArgs;
 /// Top-level parsed CLI command.
 #[derive(Parser, Debug)]
 #[command(
-    name = "container-runtime",
+    name = "agent-jail",
     version,
-    about = "A toy container runtime for learning"
+    about = "An isolated environment where AI agents can install dependencies and run experiments without root privileges"
 )]
 pub struct Cli {
     /// The subcommand to dispatch (run, ...).
@@ -42,17 +42,17 @@ mod tests {
 
     #[test]
     fn parses_run_bundle() {
-        let cli = Cli::try_parse_from(["container-runtime", "run-bundle", "./bundle"]).unwrap();
+        let cli = Cli::try_parse_from(["agent-jail", "run-bundle", "./bundle"]).unwrap();
         let Command::RunBundle { bundle } = cli.command else {
             panic!("expected the run-bundle command");
         };
         assert_eq!(bundle, PathBuf::from("./bundle"));
-        assert!(Cli::try_parse_from(["container-runtime", "run-bundle"]).is_err());
+        assert!(Cli::try_parse_from(["agent-jail", "run-bundle"]).is_err());
     }
 
     #[test]
     fn parses_run_with_default_limits() {
-        let args = run_args(&["container-runtime", "run", "./rootfs", "/bin/sh"]);
+        let args = run_args(&["agent-jail", "run", "./rootfs", "/bin/sh"]);
         assert_eq!(args.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(args.cmd, "/bin/sh");
         assert!(args.args.is_empty());
@@ -64,7 +64,7 @@ mod tests {
     #[test]
     fn parses_limits_and_hyphenated_command_arguments() {
         let args = run_args(&[
-            "container-runtime",
+            "agent-jail",
             "run",
             "--cpus",
             "0.5",
@@ -85,11 +85,11 @@ mod tests {
 
     #[test]
     fn rejects_missing_run_inputs_and_invalid_numeric_limits() {
-        assert!(Cli::try_parse_from(["container-runtime"]).is_err());
-        assert!(Cli::try_parse_from(["container-runtime", "run", "./rootfs"]).is_err());
+        assert!(Cli::try_parse_from(["agent-jail"]).is_err());
+        assert!(Cli::try_parse_from(["agent-jail", "run", "./rootfs"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "container-runtime",
+                "agent-jail",
                 "run",
                 "--mem",
                 "invalid",

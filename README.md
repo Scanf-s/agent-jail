@@ -1,4 +1,4 @@
-# Container Runtime
+# agent-jail
 
 This project is for developers who do not want AI agents to fill their system with stray files and extra dependencies.
 It gives AI agents an isolated environment for their work, and it runs without root privileges.
@@ -40,7 +40,7 @@ cargo build --release
 3. Run the binary.
 
 ```bash
-./target/release/container-runtime run ./rootfs \
+./target/release/agent-jail run ./rootfs \
   --cpus 1.0 --mem 536870912 --pids 1024 /bin/sh
 ```
 
@@ -59,7 +59,7 @@ Like `run`, it waits until the program finishes.
 2. Run the example bundle.
 
 ```bash
-./target/release/container-runtime run-bundle ./examples/oci-bundle
+./target/release/agent-jail run-bundle ./examples/oci-bundle
 ```
 
 The program prints `OCI_STARTED`, its working directory, its user, and its environment.

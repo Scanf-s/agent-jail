@@ -108,7 +108,7 @@ impl Cgroup {
     }
 
     fn create_cgroup_dir(parent: &Path) -> Result<Self> {
-        let id = format!("rust_container_{:x}", random::<u64>());
+        let id = format!("jail_{:x}", random::<u64>());
         let path = parent.join(&id);
         fs::create_dir(&path).context("create cgroup dir")?;
         // From here on, Drop removes the directory if a later check fails.
@@ -181,8 +181,8 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("container-runtime-cgroup-{:x}", random::<u64>()));
+            let path =
+                std::env::temp_dir().join(format!("agent-jail-cgroup-{:x}", random::<u64>()));
             fs::create_dir(&path).unwrap();
             Self(path)
         }

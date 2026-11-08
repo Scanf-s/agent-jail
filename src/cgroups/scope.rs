@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // The scope name shows that the runtime started it, so a second failure stops instead of looping.
-const SCOPE_PREFIX: &str = "container-runtime-";
+const SCOPE_PREFIX: &str = "agent-jail-";
 
 /// Return the delegated cgroup that the runtime runs in.
 ///
@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn recognizes_a_scope_that_the_runtime_created() {
-        let ours = Path::new("/sys/fs/cgroup/app.slice/container-runtime-1a2b.scope");
+        let ours = Path::new("/sys/fs/cgroup/app.slice/agent-jail-1a2b.scope");
         assert!(started_by_runtime(ours));
         assert!(!started_by_runtime(Path::new("/sys/fs/cgroup/init.scope")));
         assert!(!started_by_runtime(Path::new(
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn passes_the_original_arguments_after_the_separator() {
         let args = ["run", "./rootfs", "/bin/sh", "-c", "echo --unit=x"].map(OsString::from);
-        let command = scope_command(Path::new("/opt/runtime"), args, "container-runtime-1");
+        let command = scope_command(Path::new("/opt/runtime"), args, "agent-jail-1");
 
         assert_eq!(command.get_program(), "systemd-run");
         let actual: Vec<_> = command.get_args().collect();
@@ -84,7 +84,7 @@ mod tests {
                 "--collect",
                 "--property",
                 "Delegate=yes",
-                "--unit=container-runtime-1",
+                "--unit=agent-jail-1",
                 "--",
                 "/opt/runtime",
                 "run",

@@ -30,8 +30,8 @@ mod tests {
 
     impl TempDir {
         fn new() -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("container-runtime-bundle-{:x}", random::<u64>()));
+            let path =
+                std::env::temp_dir().join(format!("agent-jail-bundle-{:x}", random::<u64>()));
             fs::create_dir(&path).unwrap();
             Self(path)
         }
