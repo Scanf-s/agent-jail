@@ -10,6 +10,7 @@ mod container;
 mod filesystem;
 mod ipc;
 mod oci;
+mod paths;
 mod runtime;
 mod user;
 

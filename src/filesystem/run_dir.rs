@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use crate::paths;
+use anyhow::{Context, Result};
 use rand::random;
 use std::fs;
 use std::io;
@@ -14,7 +15,7 @@ pub struct RunDir {
 impl RunDir {
     /// Create a new run directory under `$XDG_DATA_HOME/agent-jail/runs`.
     pub fn create() -> Result<Self> {
-        Self::create_in(&data_home()?.join("agent-jail/runs"))
+        Self::create_in(&paths::data_dir()?.join("runs"))
     }
 
     fn create_in(runs: &Path) -> Result<Self> {
@@ -55,19 +56,6 @@ impl RunDir {
             _ => Ok(()),
         }
     }
-}
-
-fn data_home() -> Result<PathBuf> {
-    // The XDG Base Directory specification says to ignore a relative path.
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
-        && dir.is_absolute()
-    {
-        return Ok(dir);
-    }
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        bail!("neither XDG_DATA_HOME nor HOME is set");
-    };
-    Ok(home.join(".local/share"))
 }
 
 #[cfg(test)]

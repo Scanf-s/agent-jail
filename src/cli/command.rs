@@ -52,8 +52,8 @@ mod tests {
 
     #[test]
     fn parses_run_with_default_limits() {
-        let args = run_args(&["aj", "run", "./rootfs", "/bin/sh"]);
-        assert_eq!(args.rootfs, PathBuf::from("./rootfs"));
+        let args = run_args(&["aj", "run", "/bin/sh"]);
+        assert_eq!(args.rootfs, None);
         assert_eq!(args.cmd, "/bin/sh");
         assert!(args.args.is_empty());
         assert_eq!(args.cpus, 1.0);
@@ -72,11 +72,15 @@ mod tests {
             "1048576",
             "--pids",
             "64",
+            "--rootfs",
             "./rootfs",
+            "--",
             "/bin/sh",
             "-c",
             "echo hello",
         ]);
+        assert_eq!(args.rootfs, Some(PathBuf::from("./rootfs")));
+        assert_eq!(args.cmd, "/bin/sh");
         assert_eq!(args.cpus, 0.5);
         assert_eq!(args.mem, 1_048_576);
         assert_eq!(args.pids, 64);
@@ -86,9 +90,8 @@ mod tests {
     #[test]
     fn rejects_missing_run_inputs_and_invalid_numeric_limits() {
         assert!(Cli::try_parse_from(["aj"]).is_err());
-        assert!(Cli::try_parse_from(["aj", "run", "./rootfs"]).is_err());
-        assert!(
-            Cli::try_parse_from(["aj", "run", "--mem", "invalid", "./rootfs", "/bin/sh",]).is_err()
-        );
+        assert!(Cli::try_parse_from(["aj", "run"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "run", "--rootfs", "./rootfs"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "run", "--mem", "invalid", "/bin/sh"]).is_err());
     }
 }

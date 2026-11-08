@@ -1,14 +1,16 @@
 use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, ProcessConfig};
-use anyhow::{Context, Result, bail};
+use crate::paths;
+use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 pub struct RunArgs {
-    /// Path to the rootfs directory (e.g. ./rootfs).
-    pub rootfs: PathBuf,
+    /// Rootfs directory [default: $XDG_DATA_HOME/agent-jail/images/default].
+    #[arg(long)]
+    pub rootfs: Option<PathBuf>,
 
     /// Number of CPUs (e.g. 0.5 for half a core, 2.0 for two cores).
     #[arg(long, default_value_t = 1.0)]
@@ -34,13 +36,14 @@ impl RunArgs {
     /// Validate the CLI input and convert it into the runtime configuration.
     pub fn into_config(self) -> Result<ContainerConfig> {
         let resources = self.validate()?;
+        let rootfs = resolve_rootfs(self.rootfs)?;
 
         let mut args = Vec::with_capacity(self.args.len() + 1);
         args.push(self.cmd);
         args.extend(self.args);
 
         Ok(ContainerConfig {
-            rootfs: self.rootfs,
+            rootfs,
             process: ProcessConfig {
                 args,
                 // Pass the runtime's own environment so that `run` keeps inheriting it.
@@ -60,13 +63,6 @@ impl RunArgs {
     }
 
     fn validate(&self) -> Result<CgroupSettings> {
-        if !self.rootfs.is_dir() {
-            bail!(
-                "rootfs {:?} does not exist or is not a directory",
-                self.rootfs
-            );
-        }
-
         if !self.cpus.is_finite() || self.cpus <= 0.0 {
             bail!("--cpus must be finite and positive but got {}", self.cpus);
         }
@@ -94,6 +90,22 @@ impl RunArgs {
     }
 }
 
+fn resolve_rootfs(requested: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(rootfs) = requested {
+        ensure!(
+            rootfs.is_dir(),
+            "rootfs {rootfs:?} does not exist or is not a directory"
+        );
+        return Ok(rootfs);
+    }
+    let rootfs = paths::default_rootfs()?;
+    ensure!(
+        rootfs.is_dir(),
+        "no rootfs at {rootfs:?}; fetch one with ./scripts/fetch-rootfs.sh, or name another with --rootfs"
+    );
+    Ok(rootfs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,7 +113,7 @@ mod tests {
     #[test]
     fn rejects_invalid_cpu_limits() {
         let mut args = RunArgs {
-            rootfs: PathBuf::from("/"),
+            rootfs: Some(PathBuf::from("/")),
             cpus: 1.0,
             mem: 1,
             pids: 1,
@@ -119,7 +131,7 @@ mod tests {
     #[test]
     fn converts_cli_input_into_container_config() {
         let args = RunArgs {
-            rootfs: PathBuf::from("."),
+            rootfs: Some(PathBuf::from(".")),
             cpus: 1.0,
             mem: 1,
             pids: 1,

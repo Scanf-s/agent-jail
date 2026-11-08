@@ -1,8 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
-# Use the first CLI argument if provided, else default to ./rootfs
-ROOTFS_DIR="${1:-./rootfs}"
+# Use the first CLI argument if provided, else the default rootfs that `aj run` uses.
+# The XDG Base Directory specification says to ignore a relative XDG_DATA_HOME.
+DATA_HOME="${XDG_DATA_HOME:-}"
+[[ "$DATA_HOME" == /* ]] || DATA_HOME="$HOME/.local/share"
+ROOTFS_DIR="${1:-$DATA_HOME/agent-jail/images/default}"
 VERSION="3.24.2"
 ARCH="$(uname -m)"
 URL="https://dl-cdn.alpinelinux.org/alpine/v${VERSION%.*}/releases/${ARCH}/alpine-minirootfs-${VERSION}-${ARCH}.tar.gz"

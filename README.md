@@ -25,10 +25,10 @@ This project runs only on Linux. macOS support is planned for a later version.
 
 ### Run directly on the host
 
-1. Fetch the rootfs. The script skips the download if `./rootfs` already has contents.
+1. Fetch the default rootfs into `~/.local/share/agent-jail/images/default`. If `XDG_DATA_HOME` is set, the script uses `$XDG_DATA_HOME/agent-jail/images/default` instead. The script skips the download if the directory already has contents.
 
 ```bash
-./scripts/fetch-rootfs.sh ./rootfs
+./scripts/fetch-rootfs.sh
 ```
 
 2. Build the binary.
@@ -40,8 +40,14 @@ cargo build --release
 3. Run the binary.
 
 ```bash
-./target/release/aj run ./rootfs \
-  --cpus 1.0 --mem 536870912 --pids 1024 /bin/sh
+./target/release/aj run --cpus 1.0 --mem 536870912 --pids 1024 -- /bin/sh
+```
+
+To use another rootfs, fetch it into a directory of your choice and pass that directory with `--rootfs`.
+
+```bash
+./scripts/fetch-rootfs.sh ./rootfs
+./target/release/aj run --rootfs ./rootfs -- /bin/sh
 ```
 
 ### Run with an OCI bundle
