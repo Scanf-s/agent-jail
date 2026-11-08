@@ -1,4 +1,4 @@
-use crate::cgroups::Cgroup;
+use crate::cgroups::{self, Cgroup};
 use crate::config::ContainerConfig;
 use crate::container;
 use crate::filesystem::PivotRoot;
@@ -19,7 +19,9 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(config: ContainerConfig) -> Result<Self> {
-        let cgroup = Cgroup::new()?;
+        // This may replace the process, so it runs before the runtime opens any resource.
+        let delegated = cgroups::enter_delegated_cgroup()?;
+        let cgroup = Cgroup::new(&delegated)?;
         cgroup.configure(&config.resources)?;
 
         // ipc setup for the parent and the child process communication

@@ -30,11 +30,21 @@ fn unified_cgroup_path(proc_cgroup: &str) -> Result<PathBuf> {
         .context("no cgroup v2 entry in /proc/self/cgroup")
 }
 
+/// Return the absolute path of the cgroup that this process belongs to.
+pub fn own_cgroup() -> Result<PathBuf> {
+    let root = Path::new(CGROUP_ROOT);
+    if !root.join("cgroup.controllers").is_file() {
+        bail!("cgroupfs is not v2 (or not mounted)");
+    }
+    let own = fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
+    Ok(root.join(unified_cgroup_path(&own)?))
+}
+
 /// Check that the runtime can create the container cgroup under `dir`.
 ///
 /// `dir` must be writable by this user and must hold no other process, because a cgroup that
 /// holds processes cannot pass controllers to its children.
-fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
+pub fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
     access(&dir.join("cgroup.subtree_control"), AccessFlags::W_OK)
         .with_context(|| format!("cgroup {dir:?} is not delegated to this user"))?;
 
@@ -74,16 +84,9 @@ pub struct Cgroup {
 }
 
 impl Cgroup {
-    /// Create the container cgroup inside the delegated cgroup that the runtime runs in.
-    pub fn new() -> Result<Self> {
-        let root = Path::new(CGROUP_ROOT);
-        if !root.join("cgroup.controllers").is_file() {
-            bail!("cgroupfs is not v2 (or not mounted)");
-        }
-
-        let own = fs::read_to_string("/proc/self/cgroup").context("read /proc/self/cgroup")?;
-        let delegated = root.join(unified_cgroup_path(&own)?);
-        Self::create_in(&delegated, Pid::this())
+    /// Create the container cgroup inside `delegated`, the cgroup that the runtime runs in.
+    pub fn new(delegated: &Path) -> Result<Self> {
+        Self::create_in(delegated, Pid::this())
     }
 
     fn create_in(delegated: &Path, runtime: Pid) -> Result<Self> {
