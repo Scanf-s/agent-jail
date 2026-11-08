@@ -40,7 +40,7 @@ cargo build --release
 3. Run the binary.
 
 ```bash
-./target/release/agent-jail run ./rootfs \
+./target/release/aj run ./rootfs \
   --cpus 1.0 --mem 536870912 --pids 1024 /bin/sh
 ```
 
@@ -59,7 +59,7 @@ Like `run`, it waits until the program finishes.
 2. Run the example bundle.
 
 ```bash
-./target/release/agent-jail run-bundle ./examples/oci-bundle
+./target/release/aj run-bundle ./examples/oci-bundle
 ```
 
 The program prints `OCI_STARTED`, its working directory, its user, and its environment.

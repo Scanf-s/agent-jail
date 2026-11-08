@@ -21,7 +21,7 @@ fn main() -> Result<ExitCode> {
     // The cgroup setup needs a cgroup that systemd delegates to a normal user.
     ensure!(
         !Uid::effective().is_root(),
-        "agent-jail does not run as root; run it as a normal user without sudo"
+        "aj does not run as root; run it as a normal user without sudo"
     );
 
     let mapping = user::Mapping::for_current_user()?;
