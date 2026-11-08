@@ -54,18 +54,19 @@ To use another rootfs, fetch it into a directory of your choice and pass that di
 
 Each run starts from the rootfs and writes its changes to a separate directory under `~/.local/share/agent-jail/runs`. Packages that a run installs therefore never change the rootfs. The runtime removes the directory when the run ends.
 
-Use `-v HOST[:CONTAINER][:ro]` to make a host file or directory visible in the container. Without `CONTAINER`, the container path is the same as the host path. Add `:ro` to make it read-only. Use `-w` to choose the working directory. Without `-w`, the program starts in your current directory if a volume contains it, and in `/` otherwise.
+Use `-v HOST[:CONTAINER][:ro]` to make a host file or directory visible in the container.
+
+Without `CONTAINER`, the container path is the same as the host path.
+
+Add `:ro` to make it read-only. 
+
+Use `-w` to choose the working directory. Without `-w`, the program starts in your current directory if a volume contains it, and in `/` otherwise.
 
 ```bash
 cd ~/my-project
-~/development/agent-jail/target/release/aj run -v . -- make test
-~/development/agent-jail/target/release/aj run -v ./data:/data:ro -w /data -- ls
-```
-
-The host shell handles `&&`, `;`, and `|` before `aj` starts. In `aj run -- make && make test`, only `make` runs in the container, and `make test` runs on the host. To run several commands in the container, pass them to a shell in the container:
-
-```bash
-~/development/agent-jail/target/release/aj run -v . -- /bin/sh -c 'make && make test'
+aj run -v . -- make test
+aj run -v ./data:/data:ro -w /data -- ls
+aj run -v . -- /bin/sh -c 'make && make test'
 ```
 
 Programs in the container can read their own limits in `/sys/fs/cgroup`, for example `memory.max`, `cpu.max`, and `pids.max`.
