@@ -21,7 +21,8 @@
       { "type": "user" },
       { "type": "pid" },
       { "type": "network" },
-      { "type": "mount" }
+      { "type": "mount" },
+      { "type": "cgroup" }
     ],
     "resources": {
       "cpu": { "quota": 100000, "period": 100000 },

@@ -114,8 +114,10 @@ impl Runtime {
 
     fn launch_init(&self) -> Result<()> {
         // The next fork places container init at PID 1 in the new PID namespace.
-        unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET)
-            .context("unshare(CLONE_NEWPID | CLONE_NEWNET)")?;
+        // This process already belongs to the container cgroup, so the new cgroup namespace
+        // shows that cgroup as its root.
+        unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWCGROUP)
+            .context("unshare(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWCGROUP)")?;
 
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {

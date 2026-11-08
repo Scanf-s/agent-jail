@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 const SUPPORTED_OCI_VERSION: &str = "1.3.0";
 
 // The runtime always creates exactly these namespaces.
-const REQUIRED_NAMESPACES: [LinuxNamespaceType; 4] = [
+const REQUIRED_NAMESPACES: [LinuxNamespaceType; 5] = [
     LinuxNamespaceType::User,
     LinuxNamespaceType::Pid,
     LinuxNamespaceType::Network,
     LinuxNamespaceType::Mount,
+    LinuxNamespaceType::Cgroup,
 ];
 
 // Container init always mounts proc at /proc with these flags.
@@ -468,7 +469,8 @@ mod tests {
                     { "type": "user" },
                     { "type": "pid" },
                     { "type": "network" },
-                    { "type": "mount" }
+                    { "type": "mount" },
+                    { "type": "cgroup" }
                 ],
                 "uidMappings": [
                     { "containerID": 0, "hostID": 1000, "size": 1 },
@@ -565,6 +567,7 @@ mod tests {
     fn accepts_namespaces_in_any_order() {
         let mut config = sample();
         config["linux"]["namespaces"] = json!([
+            { "type": "cgroup" },
             { "type": "mount" },
             { "type": "network" },
             { "type": "user" },

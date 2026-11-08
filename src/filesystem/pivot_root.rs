@@ -46,6 +46,7 @@ impl PivotRoot {
 
         // Mount necessary virtual filesystems
         self.mount_proc()?;
+        self.mount_sys()?;
         prepare_dev(&self.merged)?;
         // Host paths are visible only before pivot_root, and destinations must be resolved
         // only after it.
@@ -113,6 +114,23 @@ impl PivotRoot {
             None,
         )
         .with_context(|| format!("mount proc on {:?}", proc_path))?;
+        Ok(())
+    }
+
+    // Programs such as the JVM and the Go runtime read their limits from /sys/fs/cgroup.
+    // The kernel allows sysfs only because the container has its own network namespace, and
+    // cgroup2 shows the container's cgroup as the root because of the cgroup namespace.
+    fn mount_sys(&self) -> Result<()> {
+        let flags =
+            MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC;
+        let sys = self.merged.join("sys");
+        fs::create_dir_all(&sys).with_context(|| format!("create {sys:?}"))?;
+        mount::<_, _, _, str>(Some("sysfs"), &sys, Some("sysfs"), flags, None)
+            .with_context(|| format!("mount sysfs on {sys:?}"))?;
+
+        let cgroup = sys.join("fs/cgroup");
+        mount::<_, _, _, str>(Some("cgroup2"), &cgroup, Some("cgroup2"), flags, None)
+            .with_context(|| format!("mount cgroup2 on {cgroup:?}"))?;
         Ok(())
     }
 
