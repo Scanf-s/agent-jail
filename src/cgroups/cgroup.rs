@@ -65,6 +65,7 @@ pub fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
 // Resource limits for the container's cgroup.
 pub struct CgroupSettings {
     pub cpu: Option<CpuMax>,
+    /// RAM limit in bytes. Setting it also stops the container from using swap.
     pub memory_max: Option<u64>,
     pub pids_max: Option<u64>,
 }
@@ -126,6 +127,9 @@ impl Cgroup {
         }
         if let Some(bytes) = settings.memory_max {
             self.set_memory_max(bytes)?;
+            // memory.max limits only RAM. Without this, the kernel moves the excess to swap
+            // instead of stopping the container at the limit.
+            self.set_swap_max(0)?;
         }
         if let Some(pids) = settings.pids_max {
             self.set_pids_max(pids)?;
@@ -140,6 +144,12 @@ impl Cgroup {
 
     fn set_memory_max(&self, bytes: u64) -> Result<()> {
         fs::write(self.path.join("memory.max"), bytes.to_string()).context("write memory.max")?;
+        Ok(())
+    }
+
+    fn set_swap_max(&self, bytes: u64) -> Result<()> {
+        fs::write(self.path.join("memory.swap.max"), bytes.to_string())
+            .context("write memory.swap.max")?;
         Ok(())
     }
 
@@ -318,12 +328,22 @@ mod tests {
             "536870912"
         );
         assert_eq!(
+            fs::read_to_string(path.join("memory.swap.max")).unwrap(),
+            "0"
+        );
+        assert_eq!(
             fs::read_to_string(path.join("cpu.max")).unwrap(),
             "5000 10000"
         );
         assert_eq!(fs::read_to_string(path.join("pids.max")).unwrap(), "64");
 
-        for file in ["cgroup.procs", "memory.max", "cpu.max", "pids.max"] {
+        for file in [
+            "cgroup.procs",
+            "memory.max",
+            "memory.swap.max",
+            "cpu.max",
+            "pids.max",
+        ] {
             fs::remove_file(path.join(file)).unwrap();
         }
         drop(cgroup);
@@ -345,6 +365,7 @@ mod tests {
 
         assert!(!temp.0.join("cpu.max").exists());
         assert!(!temp.0.join("memory.max").exists());
+        assert!(!temp.0.join("memory.swap.max").exists());
         assert_eq!(fs::read_to_string(temp.0.join("pids.max")).unwrap(), "64");
     }
 
