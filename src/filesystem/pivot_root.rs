@@ -4,6 +4,7 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{chdir, fchdir, pivot_root};
 use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,17 @@ impl PivotRoot {
     }
 
     fn validate_rootfs(&self) -> Result<()> {
+        // Container init runs in a new user namespace, where root's capabilities do not apply to
+        // directories with an unmapped owner. Only their permission bits for other users count.
+        if let Err(error) = fs::metadata(&self.rootfs)
+            && error.kind() == io::ErrorKind::PermissionDenied
+        {
+            bail!(
+                "cannot reach rootfs {:?} from the container user namespace: \
+                 every directory above it must allow search by other users ({error})",
+                self.rootfs
+            );
+        }
         if !self.rootfs.is_dir() {
             bail!(
                 "rootfs {:?} does not exist or is not a directory",
@@ -111,6 +123,7 @@ fn open_dir_path(path: &Path) -> Result<File> {
 mod tests {
     use super::*;
     use rand::random;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn rejects_missing_rootfs_before_mount_operations() {
@@ -139,6 +152,28 @@ mod tests {
                 .contains("does not exist or is not a directory")
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn explains_a_rootfs_that_cannot_be_reached() {
+        // Root bypasses directory permissions on the host, so this case cannot be reproduced.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let parent = std::env::temp_dir().join(format!("rootfs-parent-{:x}", random::<u64>()));
+        let rootfs = parent.join("rootfs");
+        fs::create_dir_all(&rootfs).unwrap();
+        // Without the execute bit, nothing can search the parent directory.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = PivotRoot::new(rootfs).validate_rootfs().unwrap_err();
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(&parent).unwrap();
+        assert!(
+            error.to_string().contains("cannot reach rootfs"),
+            "{error:#}"
+        );
     }
 
     #[test]
