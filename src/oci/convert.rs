@@ -1,7 +1,8 @@
 use super::Bundle;
 use crate::cgroups::{CgroupSettings, CpuMax};
-use crate::config::{ContainerConfig, IdMapping, ProcessConfig};
+use crate::config::{ContainerConfig, ProcessConfig};
 use anyhow::{Context, Result, bail, ensure};
+use nix::unistd::{Gid, Uid};
 use oci_spec::runtime::{
     Linux, LinuxCpu, LinuxIdMapping, LinuxMemory, LinuxNamespace, LinuxNamespaceType, LinuxPids,
     LinuxResources, Mount, Process, Root, Spec,
@@ -31,6 +32,11 @@ const MIN_CPU_QUOTA_US: i64 = 1_000;
 impl Bundle {
     // Check that this runtime can apply every requested setting, then convert the configuration.
     pub fn into_config(self) -> Result<ContainerConfig> {
+        self.into_config_for(Uid::effective().as_raw(), Gid::effective().as_raw())
+    }
+
+    // `host_uid` and `host_gid` belong to the user who runs the runtime.
+    fn into_config_for(self, host_uid: u32, host_gid: u32) -> Result<ContainerConfig> {
         let spec = &self.spec;
         check_version(spec.version())?;
         reject_unsupported_top_level(spec)?;
@@ -40,17 +46,22 @@ impl Bundle {
         let linux = spec.linux().as_ref().context("linux is required")?;
         check_namespaces(linux.namespaces().as_deref())?;
         reject_unsupported_linux(linux)?;
-        let id_mapping = IdMapping {
-            host_uid: root_mapping("linux.uidMappings", linux.uid_mappings().as_deref())?,
-            host_gid: root_mapping("linux.gidMappings", linux.gid_mappings().as_deref())?,
-        };
+        check_root_mapping(
+            "linux.uidMappings",
+            linux.uid_mappings().as_deref(),
+            host_uid,
+        )?;
+        check_root_mapping(
+            "linux.gidMappings",
+            linux.gid_mappings().as_deref(),
+            host_gid,
+        )?;
         let process = process_config(spec.process().as_ref())?;
         let resources = cgroup_settings(linux.resources().as_ref())?;
 
         Ok(ContainerConfig {
             rootfs,
             process,
-            id_mapping,
             resources,
         })
     }
@@ -179,14 +190,25 @@ fn reject_unsupported_linux(linux: &Linux) -> Result<()> {
     ])
 }
 
-// The mapping code writes a single line that maps container ID 0 to one host ID.
-fn root_mapping(field: &str, mappings: Option<&[LinuxIdMapping]>) -> Result<u32> {
-    match mappings {
-        Some([mapping]) if mapping.container_id() == 0 && mapping.size() == 1 => {
-            Ok(mapping.host_id())
-        }
-        _ => bail!("{field} must contain exactly one entry with containerID 0 and size 1"),
-    }
+// Without privilege, the runtime can map container ID 0 only to its own host ID.
+fn check_root_mapping(
+    field: &str,
+    mappings: Option<&[LinuxIdMapping]>,
+    host_id: u32,
+) -> Result<()> {
+    let Some([mapping]) = mappings else {
+        bail!("{field} must contain exactly one entry with containerID 0 and size 1");
+    };
+    ensure!(
+        mapping.container_id() == 0 && mapping.size() == 1,
+        "{field} must contain exactly one entry with containerID 0 and size 1"
+    );
+    ensure!(
+        mapping.host_id() == host_id,
+        "{field}[0].hostID must be {host_id}, the ID of the user who runs the runtime, but got {}",
+        mapping.host_id()
+    );
+    Ok(())
 }
 
 fn process_config(process: Option<&Process>) -> Result<ProcessConfig> {
@@ -439,12 +461,17 @@ mod tests {
         })
     }
 
+    // The sample maps container root to host UID 1000 and GID 1001.
     fn convert(config: Value) -> Result<ContainerConfig> {
+        convert_as(config, 1000, 1001)
+    }
+
+    fn convert_as(config: Value, host_uid: u32, host_gid: u32) -> Result<ContainerConfig> {
         Bundle {
             path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             spec: serde_json::from_value(config)?,
         }
-        .into_config()
+        .into_config_for(host_uid, host_gid)
     }
 
     #[test]
@@ -459,8 +486,6 @@ mod tests {
         assert_eq!(config.process.env, ["PATH=/bin:/usr/bin"]);
         assert_eq!(config.process.cwd, Path::new("/"));
         assert_eq!((config.process.uid, config.process.gid), (0, 0));
-        assert_eq!(config.id_mapping.host_uid, 1000);
-        assert_eq!(config.id_mapping.host_gid, 1001);
 
         let cpu = config.resources.cpu.unwrap();
         assert_eq!((cpu.quota_us.get(), cpu.period_us), (50_000, 200_000));
@@ -517,7 +542,8 @@ mod tests {
         let mut config: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         // The example rootfs is not committed, so point root.path at a directory that exists.
         config["root"]["path"] = json!("src");
-        assert!(convert(config).is_ok());
+        // The example maps container root to host UID and GID 1000.
+        convert_as(config, 1000, 1000).unwrap();
     }
 
     #[test]
@@ -596,6 +622,14 @@ mod tests {
             (
                 |c| c["linux"]["uidMappings"][0]["size"] = json!(65536),
                 "linux.uidMappings",
+            ),
+            (
+                |c| c["linux"]["uidMappings"][0]["hostID"] = json!(0),
+                "linux.uidMappings[0].hostID must be 1000",
+            ),
+            (
+                |c| c["linux"]["gidMappings"][0]["hostID"] = json!(1000),
+                "linux.gidMappings[0].hostID must be 1001",
             ),
             (
                 |c| {

@@ -34,14 +34,13 @@ cargo build --release
 
 ```bash
 sudo ./target/release/container-runtime run ./rootfs \
-  --cpus 1.0 --mem 536870912 --pids 1024 \
-  --uid "$(id -u)" --gid "$(id -g)" /bin/sh
+  --cpus 1.0 --mem 536870912 --pids 1024 /bin/sh
 ```
 
 Two notes about this command:
 
 - Avoid `sudo cargo run` when you installed Rust with `rustup`. The root PATH usually does not include `~/.cargo/bin`, so the command fails. Build first, then run the produced binary with `sudo`.
-- `--uid` and `--gid` set the host user that container root maps to. `$(id -u)` and `$(id -g)` map it to yourself, so files created inside the container stay writable for you.
+- Container root maps to the user who runs the runtime, so files created inside the container stay writable for you.
 
 ### Run an OCI bundle
 
@@ -65,7 +64,7 @@ Notes about bundles:
 
 - The runtime supports only part of the OCI runtime specification 1.3.0. If `config.json` requests a setting that the runtime cannot apply, the command fails before it creates the container, and the error names the field. Unknown fields are ignored.
 - `process.args[0]` must be an absolute path.
-- The example maps container root to host UID and GID 1000, like `--uid` and `--gid` in the `run` example. If `id -u` or `id -g` prints another value, change `hostID` in `linux.uidMappings` and `linux.gidMappings`.
+- `hostID` in `linux.uidMappings` and `linux.gidMappings` must be the UID and GID of the user who runs the runtime. The example uses 1000. If `id -u` or `id -g` prints another value, change `hostID`.
 - Container init reaches the rootfs from inside the new user namespace. If container root maps to a host user that cannot search every directory above the rootfs, the command fails. For example, this happens when container root maps to host root and the rootfs is under a home directory with mode `750`.
 
 ### Development commands

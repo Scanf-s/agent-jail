@@ -51,7 +51,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_run_with_default_limits_and_ids() {
+    fn parses_run_with_default_limits() {
         let args = run_args(&["container-runtime", "run", "./rootfs", "/bin/sh"]);
         assert_eq!(args.rootfs, PathBuf::from("./rootfs"));
         assert_eq!(args.cmd, "/bin/sh");
@@ -59,12 +59,10 @@ mod tests {
         assert_eq!(args.cpus, 1.0);
         assert_eq!(args.mem, 512 * 1024 * 1024);
         assert_eq!(args.pids, 1024);
-        assert_eq!(args.uid, 0);
-        assert_eq!(args.gid, 0);
     }
 
     #[test]
-    fn parses_limits_ids_and_hyphenated_command_arguments() {
+    fn parses_limits_and_hyphenated_command_arguments() {
         let args = run_args(&[
             "container-runtime",
             "run",
@@ -74,10 +72,6 @@ mod tests {
             "1048576",
             "--pids",
             "64",
-            "--uid",
-            "1000",
-            "--gid",
-            "1001",
             "./rootfs",
             "/bin/sh",
             "-c",
@@ -86,8 +80,6 @@ mod tests {
         assert_eq!(args.cpus, 0.5);
         assert_eq!(args.mem, 1_048_576);
         assert_eq!(args.pids, 64);
-        assert_eq!(args.uid, 1000);
-        assert_eq!(args.gid, 1001);
         assert_eq!(args.args, ["-c", "echo hello"]);
     }
 

@@ -66,14 +66,11 @@ impl Runtime {
         ipc.signal_cgroup_ready()?;
 
         // UID/GID maps can be written after the child creates its user namespace.
+        // Without privilege, the kernel lets the runtime map only its own IDs.
         ipc.wait_for_user_namespace()?;
-        Mapping::new(
-            child,
-            Uid::from_raw(self.config.id_mapping.host_uid),
-            Gid::from_raw(self.config.id_mapping.host_gid),
-        )
-        .map()
-        .context("map container UID/GID")?;
+        Mapping::new(child, Uid::effective(), Gid::effective())
+            .map()
+            .context("map container UID/GID")?;
         ipc.signal_mapping_ready()?;
         Ok(())
     }

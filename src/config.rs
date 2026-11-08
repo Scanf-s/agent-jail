@@ -6,7 +6,6 @@ pub struct ContainerConfig {
     /// Rootfs path on the host. A relative path is resolved from the current working directory.
     pub rootfs: PathBuf,
     pub process: ProcessConfig,
-    pub id_mapping: IdMapping,
     pub resources: CgroupSettings,
 }
 
@@ -22,10 +21,4 @@ pub struct ProcessConfig {
     pub uid: u32,
     /// GID that runs the program inside the container.
     pub gid: u32,
-}
-
-/// Host IDs that the container's root user and group map to.
-pub struct IdMapping {
-    pub host_uid: u32,
-    pub host_gid: u32,
 }

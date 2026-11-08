@@ -1,5 +1,5 @@
 use crate::cgroups::{CgroupSettings, CpuMax};
-use crate::config::{ContainerConfig, IdMapping, ProcessConfig};
+use crate::config::{ContainerConfig, ProcessConfig};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::num::NonZeroU64;
@@ -21,14 +21,6 @@ pub struct RunArgs {
     /// Maximum number of tasks (processes and threads).
     #[arg(long, default_value_t = 1024)]
     pub pids: u64,
-
-    /// Host UID to map with container's root user
-    #[arg(long, default_value_t = 0)]
-    pub uid: u32,
-
-    /// Host GID to map with container's root user
-    #[arg(long, default_value_t = 0)]
-    pub gid: u32,
 
     /// Command to execute inside the container.
     pub cmd: String,
@@ -61,10 +53,6 @@ impl RunArgs {
                 cwd: PathBuf::from("/"),
                 uid: 0,
                 gid: 0,
-            },
-            id_mapping: IdMapping {
-                host_uid: self.uid,
-                host_gid: self.gid,
             },
             resources,
         })
@@ -116,8 +104,6 @@ mod tests {
             cpus: 1.0,
             mem: 1,
             pids: 1,
-            uid: 0,
-            gid: 0,
             cmd: String::from("true"),
             args: Vec::new(),
         };
@@ -136,8 +122,6 @@ mod tests {
             cpus: 1.0,
             mem: 1,
             pids: 1,
-            uid: 1000,
-            gid: 1001,
             cmd: String::from("/bin/sh"),
             args: vec![String::from("-c"), String::from("echo hello")],
         };
@@ -148,7 +132,5 @@ mod tests {
         assert_eq!(config.process.env.len(), std::env::vars_os().count());
         assert_eq!(config.process.cwd, PathBuf::from("/"));
         assert_eq!((config.process.uid, config.process.gid), (0, 0));
-        assert_eq!(config.id_mapping.host_uid, 1000);
-        assert_eq!(config.id_mapping.host_gid, 1001);
     }
 }
