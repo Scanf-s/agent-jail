@@ -23,8 +23,6 @@
       { "type": "network" },
       { "type": "mount" }
     ],
-    "uidMappings": [{ "containerID": 0, "hostID": 1000, "size": 1 }],
-    "gidMappings": [{ "containerID": 0, "hostID": 1000, "size": 1 }],
     "resources": {
       "cpu": { "quota": 100000, "period": 100000 },
       "memory": { "limit": 536870912 },

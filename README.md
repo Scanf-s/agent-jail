@@ -63,7 +63,8 @@ Notes about bundles:
 
 - The runtime supports only part of the OCI runtime specification 1.3.0. If `config.json` requests a setting that the runtime cannot apply, the command fails before it creates the container, and the error names the field. Unknown fields are ignored.
 - `process.args[0]` must be an absolute path.
-- `hostID` in `linux.uidMappings` and `linux.gidMappings` must be the UID and GID of the user who runs the runtime. The example uses 1000. If `id -u` or `id -g` prints another value, change `hostID`.
+- The runtime maps container root to the user who runs it, and container IDs 1 to 65536 to that user's range in `/etc/subuid` and `/etc/subgid`. A bundle may leave out `linux.uidMappings` and `linux.gidMappings`, as the example does. If it includes them, they must describe exactly this mapping.
+- `process.user` may use any mapped container ID, and `process.user.additionalGids` sets the supplementary groups. The program never keeps the supplementary groups of the host user.
 
 ### Development commands
 

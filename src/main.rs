@@ -24,13 +24,15 @@ fn main() -> Result<ExitCode> {
         "container-runtime does not run as root; run it as a normal user without sudo"
     );
 
+    let mapping = user::Mapping::for_current_user()?;
+
     match cli.command {
         // Create a new container and run the requested command inside it.
-        cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?)?.run(),
+        cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?, mapping)?.run(),
         // Validate the whole configuration before Runtime::new creates a cgroup.
         cli::Command::RunBundle { bundle } => {
-            let config = oci::Bundle::load(&bundle)?.into_config()?;
-            runtime::Runtime::new(config)?.run()
+            let config = oci::Bundle::load(&bundle)?.into_config(&mapping)?;
+            runtime::Runtime::new(config, mapping)?.run()
         }
     }
 }

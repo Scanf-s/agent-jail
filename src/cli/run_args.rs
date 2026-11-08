@@ -53,6 +53,7 @@ impl RunArgs {
                 cwd: PathBuf::from("/"),
                 uid: 0,
                 gid: 0,
+                additional_gids: Vec::new(),
             },
             resources,
         })

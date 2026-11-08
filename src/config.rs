@@ -21,4 +21,6 @@ pub struct ProcessConfig {
     pub uid: u32,
     /// GID that runs the program inside the container.
     pub gid: u32,
+    /// Supplementary groups of the program. The host user's groups are never kept.
+    pub additional_gids: Vec<u32>,
 }

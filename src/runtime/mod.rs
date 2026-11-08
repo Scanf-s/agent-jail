@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setuid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setgroups, setuid};
 use std::process::ExitCode;
 
 pub struct Runtime {
@@ -19,9 +19,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn new(config: ContainerConfig) -> Result<Self> {
-        let mapping = Mapping::for_current_user()?;
-
+    pub fn new(config: ContainerConfig, mapping: Mapping) -> Result<Self> {
         // This may replace the process, so it runs before the runtime opens any resource.
         let delegated = cgroups::enter_delegated_cgroup()?;
         let cgroup = Cgroup::new(&delegated)?;
@@ -129,6 +127,13 @@ impl Runtime {
         let process = &self.config.process;
         chdir(&process.cwd)
             .with_context(|| format!("chdir to working directory {}", process.cwd.display()))?;
+        // Without this, the program keeps the supplementary groups of the host user.
+        let groups: Vec<Gid> = process
+            .additional_gids
+            .iter()
+            .map(|&gid| Gid::from_raw(gid))
+            .collect();
+        setgroups(&groups).context("set supplementary groups")?;
         setgid(Gid::from_raw(process.gid))?;
         setuid(Uid::from_raw(process.uid))?;
 

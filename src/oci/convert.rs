@@ -1,8 +1,8 @@
 use super::Bundle;
 use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, ProcessConfig};
+use crate::user::{IdRange, Mapping};
 use anyhow::{Context, Result, bail, ensure};
-use nix::unistd::{Gid, Uid};
 use oci_spec::runtime::{
     Linux, LinuxCpu, LinuxIdMapping, LinuxMemory, LinuxNamespace, LinuxNamespaceType, LinuxPids,
     LinuxResources, Mount, Process, Root, Spec,
@@ -31,12 +31,8 @@ const MIN_CPU_QUOTA_US: i64 = 1_000;
 
 impl Bundle {
     // Check that this runtime can apply every requested setting, then convert the configuration.
-    pub fn into_config(self) -> Result<ContainerConfig> {
-        self.into_config_for(Uid::effective().as_raw(), Gid::effective().as_raw())
-    }
-
-    // `host_uid` and `host_gid` belong to the user who runs the runtime.
-    fn into_config_for(self, host_uid: u32, host_gid: u32) -> Result<ContainerConfig> {
+    // `mapping` is the mapping that the runtime writes for the user who runs it.
+    pub fn into_config(self, mapping: &Mapping) -> Result<ContainerConfig> {
         let spec = &self.spec;
         check_version(spec.version())?;
         reject_unsupported_top_level(spec)?;
@@ -46,15 +42,15 @@ impl Bundle {
         let linux = spec.linux().as_ref().context("linux is required")?;
         check_namespaces(linux.namespaces().as_deref())?;
         reject_unsupported_linux(linux)?;
-        check_root_mapping(
+        check_mappings(
             "linux.uidMappings",
             linux.uid_mappings().as_deref(),
-            host_uid,
+            &mapping.uid_ranges(),
         )?;
-        check_root_mapping(
+        check_mappings(
             "linux.gidMappings",
             linux.gid_mappings().as_deref(),
-            host_gid,
+            &mapping.gid_ranges(),
         )?;
         let process = process_config(spec.process().as_ref())?;
         let resources = cgroup_settings(linux.resources().as_ref())?;
@@ -190,25 +186,45 @@ fn reject_unsupported_linux(linux: &Linux) -> Result<()> {
     ])
 }
 
-// Without privilege, the runtime can map container ID 0 only to its own host ID.
-fn check_root_mapping(
+// The runtime can write only its own mapping, so a bundle may leave the mappings out or
+// repeat them in any order.
+fn check_mappings(
     field: &str,
     mappings: Option<&[LinuxIdMapping]>,
-    host_id: u32,
+    expected: &[IdRange],
 ) -> Result<()> {
-    let Some([mapping]) = mappings else {
-        bail!("{field} must contain exactly one entry with containerID 0 and size 1");
+    let Some(mappings) = mappings else {
+        return Ok(());
     };
+    let mut requested: Vec<IdRange> = mappings
+        .iter()
+        .map(|mapping| IdRange {
+            container_id: mapping.container_id(),
+            host_id: mapping.host_id(),
+            count: mapping.size(),
+        })
+        .collect();
+    requested.sort_by_key(|range| range.container_id);
     ensure!(
-        mapping.container_id() == 0 && mapping.size() == 1,
-        "{field} must contain exactly one entry with containerID 0 and size 1"
-    );
-    ensure!(
-        mapping.host_id() == host_id,
-        "{field}[0].hostID must be {host_id}, the ID of the user who runs the runtime, but got {}",
-        mapping.host_id()
+        requested == expected,
+        "{field} must be {} for the user who runs the runtime, or be left out, but got {}",
+        describe_ranges(expected),
+        describe_ranges(&requested)
     );
     Ok(())
+}
+
+fn describe_ranges(ranges: &[IdRange]) -> String {
+    let entries: Vec<String> = ranges
+        .iter()
+        .map(|range| {
+            format!(
+                "{{containerID {}, hostID {}, size {}}}",
+                range.container_id, range.host_id, range.count
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(", "))
 }
 
 fn process_config(process: Option<&Process>) -> Result<ProcessConfig> {
@@ -243,18 +259,18 @@ fn process_config(process: Option<&Process>) -> Result<ProcessConfig> {
     reject_present(&[
         ("process.user.umask", user.umask().is_some()),
         ("process.user.username", user.username().is_some()),
-        (
-            "process.user.additionalGids",
-            user.additional_gids()
-                .as_ref()
-                .is_some_and(|gids| !gids.is_empty()),
-        ),
     ])?;
-    // Only container ID 0 is mapped, so the program must run as container root.
-    ensure!(
-        user.uid() == 0 && user.gid() == 0,
-        "process.user must be uid 0 and gid 0 because only container ID 0 is mapped"
-    );
+    let additional_gids = user.additional_gids().clone().unwrap_or_default();
+    let ids = [("uid", user.uid()), ("gid", user.gid())]
+        .into_iter()
+        .chain(additional_gids.iter().map(|&gid| ("additionalGids", gid)));
+    for (name, id) in ids {
+        ensure!(
+            id <= Mapping::MAX_CONTAINER_ID,
+            "process.user.{name} {id} is not mapped; container IDs 0 to {} are mapped",
+            Mapping::MAX_CONTAINER_ID
+        );
+    }
 
     let args = process.args().clone().unwrap_or_default();
     let program = args.first().context("process.args must not be empty")?;
@@ -280,6 +296,7 @@ fn process_config(process: Option<&Process>) -> Result<ProcessConfig> {
         cwd: process.cwd().clone(),
         uid: user.uid(),
         gid: user.gid(),
+        additional_gids,
     })
 }
 
@@ -422,6 +439,8 @@ fn pids_max(pids: &LinuxPids) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::user::SubordinateRange;
+    use nix::unistd::{Gid, Uid};
     use serde_json::{Value, json};
     use std::fs;
 
@@ -450,8 +469,14 @@ mod tests {
                     { "type": "network" },
                     { "type": "mount" }
                 ],
-                "uidMappings": [{ "containerID": 0, "hostID": 1000, "size": 1 }],
-                "gidMappings": [{ "containerID": 0, "hostID": 1001, "size": 1 }],
+                "uidMappings": [
+                    { "containerID": 0, "hostID": 1000, "size": 1 },
+                    { "containerID": 1, "hostID": 100000, "size": 65536 }
+                ],
+                "gidMappings": [
+                    { "containerID": 0, "hostID": 1001, "size": 1 },
+                    { "containerID": 1, "hostID": 200000, "size": 65536 }
+                ],
                 "resources": {
                     "cpu": { "quota": 50000, "period": 200000 },
                     "memory": { "limit": 536870912 },
@@ -461,17 +486,28 @@ mod tests {
         })
     }
 
-    // The sample maps container root to host UID 1000 and GID 1001.
-    fn convert(config: Value) -> Result<ContainerConfig> {
-        convert_as(config, 1000, 1001)
+    // The mapping that sample() repeats in linux.uidMappings and linux.gidMappings.
+    fn mapping() -> Mapping {
+        Mapping::new(
+            Uid::from_raw(1000),
+            Gid::from_raw(1001),
+            SubordinateRange {
+                start: 100000,
+                count: 65536,
+            },
+            SubordinateRange {
+                start: 200000,
+                count: 70000,
+            },
+        )
     }
 
-    fn convert_as(config: Value, host_uid: u32, host_gid: u32) -> Result<ContainerConfig> {
+    fn convert(config: Value) -> Result<ContainerConfig> {
         Bundle {
             path: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             spec: serde_json::from_value(config)?,
         }
-        .into_config_for(host_uid, host_gid)
+        .into_config(&mapping())
     }
 
     #[test]
@@ -542,8 +578,30 @@ mod tests {
         let mut config: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         // The example rootfs is not committed, so point root.path at a directory that exists.
         config["root"]["path"] = json!("src");
-        // The example maps container root to host UID and GID 1000.
-        convert_as(config, 1000, 1000).unwrap();
+        convert(config).unwrap();
+    }
+
+    #[test]
+    fn accepts_mappings_that_are_left_out_or_reordered() {
+        let mut config = sample();
+        let linux = config["linux"].as_object_mut().unwrap();
+        linux.remove("uidMappings");
+        linux.remove("gidMappings");
+        convert(config).unwrap();
+
+        let mut config = sample();
+        let gid_mappings = config["linux"]["gidMappings"].as_array_mut().unwrap();
+        gid_mappings.reverse();
+        convert(config).unwrap();
+    }
+
+    #[test]
+    fn accepts_mapped_user_and_supplementary_groups() {
+        let mut config = sample();
+        config["process"]["user"] = json!({ "uid": 1000, "gid": 65536, "additionalGids": [4, 27] });
+        let process = convert(config).unwrap().process;
+        assert_eq!((process.uid, process.gid), (1000, 65536));
+        assert_eq!(process.additional_gids, [4, 27]);
     }
 
     #[test]
@@ -582,10 +640,17 @@ mod tests {
             ),
             (|c| c["process"]["rlimits"] = json!([]), "process.rlimits"),
             (
-                |c| c["process"]["user"]["additionalGids"] = json!([10]),
-                "process.user.additionalGids",
+                |c| c["process"]["user"]["additionalGids"] = json!([10, 65537]),
+                "process.user.additionalGids 65537 is not mapped",
             ),
-            (|c| c["process"]["user"]["uid"] = json!(1), "process.user"),
+            (
+                |c| c["process"]["user"]["uid"] = json!(65537),
+                "process.user.uid 65537 is not mapped",
+            ),
+            (
+                |c| c["process"]["user"]["gid"] = json!(65537),
+                "process.user.gid 65537 is not mapped",
+            ),
             (|c| c["process"]["args"] = json!([]), "process.args"),
             (
                 |c| c["process"]["args"] = json!(["sh"]),
@@ -620,22 +685,20 @@ mod tests {
                 "linux.seccomp",
             ),
             (
-                |c| c["linux"]["uidMappings"][0]["size"] = json!(65536),
-                "linux.uidMappings",
-            ),
-            (
                 |c| c["linux"]["uidMappings"][0]["hostID"] = json!(0),
-                "linux.uidMappings[0].hostID must be 1000",
+                "linux.uidMappings must be [{containerID 0, hostID 1000, size 1}, \
+                 {containerID 1, hostID 100000, size 65536}]",
             ),
             (
-                |c| c["linux"]["gidMappings"][0]["hostID"] = json!(1000),
-                "linux.gidMappings[0].hostID must be 1001",
+                |c| c["linux"]["gidMappings"][1]["size"] = json!(70000),
+                "linux.gidMappings must be",
             ),
             (
                 |c| {
-                    c["linux"].as_object_mut().unwrap().remove("gidMappings");
+                    c["linux"]["uidMappings"] =
+                        json!([{ "containerID": 0, "hostID": 1000, "size": 1 }])
                 },
-                "linux.gidMappings",
+                "linux.uidMappings must be",
             ),
             (
                 |c| c["linux"]["resources"]["devices"] = json!([]),
