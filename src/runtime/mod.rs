@@ -1,8 +1,9 @@
 use crate::cgroups::{self, Cgroup};
-use crate::config::ContainerConfig;
+use crate::config::{ContainerConfig, NetworkMode};
 use crate::container;
 use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::StartupChannels;
+use crate::network;
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
@@ -85,6 +86,13 @@ impl Runtime {
             .apply(child)
             .context("map container UIDs and GIDs")?;
         ipc.signal_mapping_ready()?;
+
+        ipc.wait_for_network_namespace()?;
+        match self.config.network {
+            // Container init brings lo up by itself.
+            NetworkMode::None => {}
+        }
+        ipc.signal_network_ready()?;
         Ok(())
     }
 
@@ -109,16 +117,19 @@ impl Runtime {
         ipc.signal_user_namespace_ready()?;
 
         ipc.wait_for_mapping()?;
-        self.launch_init()
-    }
 
-    fn launch_init(&self) -> Result<()> {
         // The next fork places container init at PID 1 in the new PID namespace.
         // This process already belongs to the container cgroup, so the new cgroup namespace
         // shows that cgroup as its root.
         unshare(CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWCGROUP)
             .context("unshare(CLONE_NEWPID | CLONE_NEWNET | CLONE_NEWCGROUP)")?;
+        ipc.signal_network_namespace_ready()?;
+        ipc.wait_for_network()?;
 
+        self.launch_init()
+    }
+
+    fn launch_init(&self) -> Result<()> {
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
                 let status = waitpid(child, None).context("waitpid(child) failed")?;
@@ -140,6 +151,10 @@ impl Runtime {
     }
 
     fn run_init(&self) -> Result<()> {
+        match self.config.network {
+            NetworkMode::None => network::bring_up_loopback()?,
+        }
+
         // file system isolation
         PivotRoot::new(
             self.config.rootfs.clone(),

@@ -9,6 +9,7 @@ mod config;
 mod container;
 mod filesystem;
 mod ipc;
+mod network;
 mod oci;
 mod paths;
 mod runtime;

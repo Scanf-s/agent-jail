@@ -31,6 +31,7 @@ pub enum Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::NetworkMode;
 
     fn run_args(args: &[&str]) -> RunArgs {
         let cli = Cli::try_parse_from(args).unwrap();
@@ -59,6 +60,7 @@ mod tests {
         assert_eq!(args.cpus, 1.0);
         assert_eq!(args.mem, 512 * 1024 * 1024);
         assert_eq!(args.pids, 1024);
+        assert_eq!(args.net, NetworkMode::None);
     }
 
     #[test]
@@ -85,6 +87,13 @@ mod tests {
         assert_eq!(args.mem, 1_048_576);
         assert_eq!(args.pids, 64);
         assert_eq!(args.args, ["-c", "echo hello"]);
+    }
+
+    #[test]
+    fn parses_net() {
+        let args = run_args(&["aj", "run", "--net", "none", "/bin/sh"]);
+        assert_eq!(args.net, NetworkMode::None);
+        assert!(Cli::try_parse_from(["aj", "run", "--net", "bridge", "/bin/sh"]).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::Bundle;
 use crate::cgroups::{CgroupSettings, CpuMax};
-use crate::config::{ContainerConfig, ProcessConfig};
+use crate::config::{ContainerConfig, NetworkMode, ProcessConfig};
 use crate::user::{IdRange, Mapping};
 use anyhow::{Context, Result, bail, ensure};
 use oci_spec::runtime::{
@@ -61,6 +61,8 @@ impl Bundle {
             process,
             resources,
             volumes: Vec::new(),
+            // check_namespaces requires a new network namespace, and bundles have no network setting.
+            network: NetworkMode::None,
         })
     }
 }

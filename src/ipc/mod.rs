@@ -1,7 +1,8 @@
 //! Pipes used to synchronize the parent and setup child during startup.
 //!
 //! Parent -> child: cgroup ready. Child -> parent: user namespace ready.
-//! Parent -> child: UID/GID mapping ready.
+//! Parent -> child: UID/GID mapping ready. Child -> parent: network namespace ready.
+//! Parent -> child: network ready.
 
 mod child_channels;
 mod parent_channels;

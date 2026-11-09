@@ -1,6 +1,6 @@
 use super::volume_arg::{default_workdir, parse_volume};
 use crate::cgroups::{CgroupSettings, CpuMax};
-use crate::config::{ContainerConfig, ProcessConfig};
+use crate::config::{ContainerConfig, NetworkMode, ProcessConfig};
 use crate::paths;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -33,6 +33,10 @@ pub struct RunArgs {
     /// contains it, else /].
     #[arg(short = 'w', long)]
     pub workdir: Option<PathBuf>,
+
+    /// Network mode of the container.
+    #[arg(long, value_enum, default_value_t = NetworkMode::None)]
+    pub net: NetworkMode,
 
     /// Command to execute inside the container.
     pub cmd: String,
@@ -87,6 +91,7 @@ impl RunArgs {
             },
             resources,
             volumes,
+            network: self.net,
         })
     }
 
@@ -147,6 +152,7 @@ mod tests {
             pids: 1,
             volumes: Vec::new(),
             workdir: None,
+            net: NetworkMode::None,
             cmd: String::from("true"),
             args: Vec::new(),
         };
@@ -167,6 +173,7 @@ mod tests {
             pids: 1,
             volumes: Vec::new(),
             workdir: None,
+            net: NetworkMode::None,
             cmd: String::from("/bin/sh"),
             args: vec![String::from("-c"), String::from("echo hello")],
         };

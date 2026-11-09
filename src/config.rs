@@ -8,6 +8,14 @@ pub struct ContainerConfig {
     pub process: ProcessConfig,
     pub resources: CgroupSettings,
     pub volumes: Vec<Volume>,
+    pub network: NetworkMode,
+}
+
+/// How the container reaches the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum NetworkMode {
+    /// A new network namespace that has only the loopback interface.
+    None,
 }
 
 /// A host file or directory that the container sees at `destination`.
