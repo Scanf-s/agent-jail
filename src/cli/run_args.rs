@@ -1,3 +1,4 @@
+use super::env_arg::build_env;
 use super::volume_arg::{default_workdir, parse_volume};
 use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, NetworkMode, ProcessConfig};
@@ -33,6 +34,11 @@ pub struct RunArgs {
     /// contains it, else /].
     #[arg(short = 'w', long)]
     pub workdir: Option<PathBuf>,
+
+    /// Set an environment variable, or copy KEY from the host. Repeatable. Without it, the
+    /// container receives only PATH, HOME, TERM, and the proxy variables.
+    #[arg(long = "env", value_name = "KEY[=VALUE]")]
+    pub envs: Vec<String>,
 
     /// Network mode of the container.
     #[arg(long, value_enum, default_value_t = NetworkMode::Pasta)]
@@ -70,6 +76,10 @@ impl RunArgs {
             }
         };
 
+        let env = build_env(&self.envs, |key| {
+            std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
+        })?;
+
         let mut args = Vec::with_capacity(self.args.len() + 1);
         args.push(self.cmd);
         args.extend(self.args);
@@ -78,12 +88,7 @@ impl RunArgs {
             rootfs,
             process: ProcessConfig {
                 args,
-                // Pass the runtime's own environment so that `run` keeps inheriting it.
-                env: std::env::vars_os()
-                    .map(|(key, value)| {
-                        format!("{}={}", key.to_string_lossy(), value.to_string_lossy())
-                    })
-                    .collect(),
+                env,
                 cwd,
                 uid: 0,
                 gid: 0,
@@ -152,6 +157,7 @@ mod tests {
             pids: 1,
             volumes: Vec::new(),
             workdir: None,
+            envs: Vec::new(),
             net: NetworkMode::None,
             cmd: String::from("true"),
             args: Vec::new(),
@@ -173,6 +179,7 @@ mod tests {
             pids: 1,
             volumes: Vec::new(),
             workdir: None,
+            envs: Vec::new(),
             net: NetworkMode::None,
             cmd: String::from("/bin/sh"),
             args: vec![String::from("-c"), String::from("echo hello")],
@@ -181,7 +188,7 @@ mod tests {
         let config = args.into_config().unwrap();
         assert_eq!(config.rootfs, PathBuf::from("."));
         assert_eq!(config.process.args, ["/bin/sh", "-c", "echo hello"]);
-        assert_eq!(config.process.env.len(), std::env::vars_os().count());
+        assert!(config.process.env.contains(&String::from("HOME=/root")));
         assert_eq!(config.process.cwd, PathBuf::from("/"));
         assert_eq!((config.process.uid, config.process.gid), (0, 0));
     }

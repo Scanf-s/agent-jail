@@ -73,6 +73,30 @@ aj run -v . -- /bin/sh -c 'make && make test'
 
 Programs in the container can read their own limits in `/sys/fs/cgroup`, for example `memory.max`, `cpu.max`, and `pids.max`.
 
+### Environment variables
+
+The container does not receive the host's environment, because it often holds secrets such as API keys.
+By default, the program receives only these variables:
+
+| Variable | Value |
+| --- | --- |
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
+| `HOME` | `/root` |
+| `TERM` | The host's value, if it is set |
+| `http_proxy`, `https_proxy`, `no_proxy`, and their uppercase forms | The host's values, if they are set |
+
+Use `--env KEY=VALUE` to set a variable, and `--env KEY` to copy the host's value.
+If the host does not set `KEY`, the container does not get it.
+`--env` can be repeated, and it overrides the defaults.
+
+`LANG` is not copied, because the rootfs may not have the host's locale.
+If a program needs a locale, set one that every rootfs has.
+
+```bash
+aj run --env LANG=C.UTF-8 -- python3 app.py
+aj run --env GITHUB_TOKEN -v . -- gh pr list
+```
+
 ### Network
 
 Use `--net` to choose the network mode.

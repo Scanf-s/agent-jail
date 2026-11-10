@@ -99,6 +99,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_repeated_env_options() {
+        let args = run_args(&["aj", "run", "--env", "A=1", "--env", "B", "/bin/sh", "-e"]);
+        assert_eq!(args.envs, ["A=1", "B"]);
+        // Commands such as `node -e` keep their own -e.
+        assert_eq!(args.args, ["-e"]);
+    }
+
+    #[test]
     fn rejects_missing_run_inputs_and_invalid_numeric_limits() {
         assert!(Cli::try_parse_from(["aj"]).is_err());
         assert!(Cli::try_parse_from(["aj", "run"]).is_err());
