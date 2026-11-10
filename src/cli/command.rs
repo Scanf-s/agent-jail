@@ -60,7 +60,7 @@ mod tests {
         assert_eq!(args.cpus, 1.0);
         assert_eq!(args.mem, 512 * 1024 * 1024);
         assert_eq!(args.pids, 1024);
-        assert_eq!(args.net, NetworkMode::None);
+        assert_eq!(args.net, NetworkMode::Pasta);
     }
 
     #[test]
@@ -93,6 +93,8 @@ mod tests {
     fn parses_net() {
         let args = run_args(&["aj", "run", "--net", "none", "/bin/sh"]);
         assert_eq!(args.net, NetworkMode::None);
+        let args = run_args(&["aj", "run", "--net", "pasta", "/bin/sh"]);
+        assert_eq!(args.net, NetworkMode::Pasta);
         assert!(Cli::try_parse_from(["aj", "run", "--net", "bridge", "/bin/sh"]).is_err());
     }
 

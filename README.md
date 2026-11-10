@@ -15,6 +15,8 @@ This project runs only on Linux. macOS support is planned for a later version.
 
 - A range of at least 65536 IDs for your user in `/etc/subuid` and `/etc/subgid`. Run `grep "^$(id -un):" /etc/subuid /etc/subgid`, and each file must show a line such as `jace:100000:65536`. `useradd` usually adds these lines. If they are missing, add them with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"`. Choose a range that no other user has.
 
+- `pasta` from the `passt` package, for network access in the container. Run `command -v pasta`, and the output must show its path. On Debian or Ubuntu, install it with `sudo apt install passt`. Without it, only `--net none` works.
+
 - systemd as PID 1 with a user instance for your user. Run `systemctl --user is-system-running`, and the output must be `running` or `degraded`. The runtime asks this instance for a cgroup that you can manage.
 
 - Rust 1.85 or newer, because the project uses the 2024 edition. The project was last checked with Rust 1.98.1.
@@ -70,6 +72,28 @@ aj run -v . -- /bin/sh -c 'make && make test'
 ```
 
 Programs in the container can read their own limits in `/sys/fs/cgroup`, for example `memory.max`, `cpu.max`, and `pids.max`.
+
+### Network
+
+Use `--net` to choose the network mode.
+
+| Mode | What the container can reach |
+| --- | --- |
+| `pasta` (default) | The internet, and its own servers through `localhost`. The runtime writes `/etc/resolv.conf` unless a volume covers it. |
+| `none` | Only its own servers through `localhost`. Use it for work that must stay offline. |
+
+```bash
+aj run -- apk add python3
+aj run --net none -v . -- make test
+```
+
+In `pasta` mode, the container cannot reach host services that listen only on `127.0.0.1`.
+It can reach host services that listen on other host addresses, including `0.0.0.0`, for example through a Docker bridge address.
+Run development services on the host with `127.0.0.1` if the container must not reach them.
+
+The host cannot reach servers in the container yet.
+
+`run-bundle` always uses `none`.
 
 ### Run with an OCI bundle
 

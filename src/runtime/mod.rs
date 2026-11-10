@@ -89,6 +89,8 @@ impl Runtime {
 
         ipc.wait_for_network_namespace()?;
         match self.config.network {
+            // The setup process lives until container init exits, so pasta keeps running.
+            NetworkMode::Pasta => network::start_pasta(child).context("start pasta")?,
             // Container init brings lo up by itself.
             NetworkMode::None => {}
         }
@@ -152,6 +154,8 @@ impl Runtime {
 
     fn run_init(&self) -> Result<()> {
         match self.config.network {
+            // pasta has already brought lo up.
+            NetworkMode::Pasta => {}
             NetworkMode::None => network::bring_up_loopback()?,
         }
 
@@ -162,6 +166,11 @@ impl Runtime {
             &self.config.volumes,
         )
         .isolate_filesystem()?;
+
+        match self.config.network {
+            NetworkMode::Pasta => network::write_resolv_conf(&self.config.volumes)?,
+            NetworkMode::None => {}
+        }
 
         let process = &self.config.process;
         chdir(&process.cwd)

@@ -14,6 +14,9 @@ pub struct ContainerConfig {
 /// How the container reaches the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum NetworkMode {
+    /// Outbound access through pasta. Host services that listen only on 127.0.0.1 stay
+    /// unreachable, but services on other host addresses are reachable.
+    Pasta,
     /// A new network namespace that has only the loopback interface.
     None,
 }

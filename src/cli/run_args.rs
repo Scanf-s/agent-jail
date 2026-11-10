@@ -35,7 +35,7 @@ pub struct RunArgs {
     pub workdir: Option<PathBuf>,
 
     /// Network mode of the container.
-    #[arg(long, value_enum, default_value_t = NetworkMode::None)]
+    #[arg(long, value_enum, default_value_t = NetworkMode::Pasta)]
     pub net: NetworkMode,
 
     /// Command to execute inside the container.
