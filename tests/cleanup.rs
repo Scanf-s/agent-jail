@@ -157,3 +157,19 @@ fn sigterm_to_the_runtime_ends_the_container() {
     assert_eq!(wait(&mut aj).code(), Some(143));
     assert_eq!(sandbox.run_dirs(), 0);
 }
+
+#[test]
+#[ignore = "starts a container"]
+fn the_next_run_removes_what_a_killed_run_left() {
+    let sandbox = Sandbox::new("sigkill");
+    let mut killed = sandbox.spawn(&format!("{CREATE_SUBORDINATE_FILE} && exec sleep 60"));
+    sandbox.wait_until_ready();
+    signal_group(&killed, Signal::SIGKILL);
+    wait(&mut killed);
+    assert_eq!(sandbox.run_dirs(), 1);
+
+    let mut next = sandbox.spawn("true");
+
+    assert_eq!(wait(&mut next).code(), Some(0));
+    assert_eq!(sandbox.run_dirs(), 0);
+}

@@ -4,4 +4,4 @@ mod run_dir;
 mod volume;
 
 pub use pivot_root::PivotRoot;
-pub use run_dir::RunDir;
+pub use run_dir::{RunDir, remove_stale as remove_stale_run_dirs};
