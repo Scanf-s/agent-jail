@@ -45,6 +45,15 @@ impl Sandbox {
 
     /// Start `aj run` with the options `run_args`, `program`, and its arguments.
     fn spawn_with(&self, run_args: &[&str], program: &[&str]) -> Child {
+        self.run_command(run_args, program).spawn().unwrap()
+    }
+
+    /// Run `aj run` as `spawn_with` does, wait for it, and return its output.
+    fn run_output(&self, run_args: &[&str], program: &[&str]) -> Output {
+        self.run_command(run_args, program).output().unwrap()
+    }
+
+    fn run_command(&self, run_args: &[&str], program: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_aj"));
         command
             .env("XDG_DATA_HOME", self.root.join("data"))
@@ -72,7 +81,7 @@ impl Sandbox {
                 Ok(())
             });
         }
-        command.spawn().unwrap()
+        command
     }
 
     /// Run `aj` with `args` against the state directories of this sandbox, and wait for it.
@@ -94,6 +103,20 @@ impl Sandbox {
         }
     }
 
+    /// Wait until the setup process records that the program runs. The program can write
+    /// its ready file before that.
+    fn wait_until_running(&self) {
+        let deadline = Instant::now() + TIMEOUT;
+        while !self
+            .states()
+            .iter()
+            .any(|state| state["status"] == "running")
+        {
+            assert!(Instant::now() < deadline, "the state never showed running");
+            sleep(Duration::from_millis(20));
+        }
+    }
+
     fn run_dirs(&self) -> usize {
         fs::read_dir(self.root.join("data/agent-jail/runs")).map_or(0, |entries| entries.count())
     }
@@ -104,8 +127,10 @@ impl Sandbox {
             return Vec::new();
         };
         entries
-            .map(|entry| {
-                let dir = entry.unwrap().path();
+            .map(|entry| entry.unwrap().path())
+            // A runtime creates its state directory under a temporary name that starts with '.'.
+            .filter(|dir| !dir.file_name().unwrap().to_str().unwrap().starts_with('.'))
+            .map(|dir| {
                 let state: Value =
                     serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
                 assert_eq!(state["id"], dir.file_name().unwrap().to_str().unwrap());
@@ -175,6 +200,7 @@ fn records_the_state_while_the_container_runs() {
     let sandbox = Sandbox::new("state");
     let mut aj = sandbox.spawn("touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done");
     sandbox.wait_until_ready();
+    sandbox.wait_until_running();
 
     let init = only_child(only_child(Pid::from_raw(aj.id() as i32)));
 
@@ -201,6 +227,7 @@ fn state_and_list_report_a_running_and_a_killed_container() {
         &["/bin/sh", "-c", "touch /out/ready && exec sleep 60"],
     );
     sandbox.wait_until_ready();
+    sandbox.wait_until_running();
     let init = only_child(only_child(Pid::from_raw(aj.id() as i32)));
 
     let state: Value = serde_json::from_slice(&sandbox.aj(&["state", "box"]).stdout).unwrap();
@@ -246,10 +273,16 @@ fn rejects_an_id_that_a_container_uses() {
     let wait_for_stop = "touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done";
     let mut first = sandbox.spawn_with(&["--id", "box"], &["/bin/sh", "-c", wait_for_stop]);
     sandbox.wait_until_ready();
+    sandbox.wait_until_running();
 
-    let mut second = sandbox.spawn_with(&["--id", "box"], &["/bin/true"]);
+    let second = sandbox.run_output(&["--id", "box"], &["/bin/true"]);
 
-    assert_eq!(wait(&mut second).code(), Some(1));
+    assert_eq!(second.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("a container with ID box already exists"),
+        "{stderr}"
+    );
     let states = sandbox.states();
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["status"], "running");
@@ -382,6 +415,7 @@ fn the_next_run_removes_what_a_killed_run_left() {
     let sandbox = Sandbox::new("sigkill");
     let mut killed = sandbox.spawn(&format!("{CREATE_SUBORDINATE_FILE} && exec sleep 60"));
     sandbox.wait_until_ready();
+    sandbox.wait_until_running();
     signal_group(&killed, Signal::SIGKILL);
     wait(&mut killed);
     assert_eq!(sandbox.run_dirs(), 1);
