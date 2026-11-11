@@ -111,6 +111,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_the_container_id_and_the_state_root() {
+        let cli = Cli::try_parse_from(["aj", "run", "--root", "/state", "--id", "box", "/bin/sh"])
+            .unwrap();
+        assert_eq!(cli.root, Some(PathBuf::from("/state")));
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run command");
+        };
+        assert_eq!(args.id.unwrap().as_str(), "box");
+
+        let error = Cli::try_parse_from(["aj", "run", "--id", "my+box", "/bin/sh"]).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid container ID"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_missing_run_inputs_and_invalid_numeric_limits() {
         assert!(Cli::try_parse_from(["aj"]).is_err());
         assert!(Cli::try_parse_from(["aj", "run"]).is_err());

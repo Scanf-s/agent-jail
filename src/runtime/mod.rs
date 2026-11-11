@@ -33,8 +33,11 @@ pub struct Runtime {
 impl Runtime {
     /// Create the resources of a new container. Its state directory goes under `state_root`.
     pub fn new(config: ContainerConfig, mapping: Mapping, state_root: &Path) -> Result<Self> {
+        if let Some(id) = &config.id {
+            StateDir::check_unused(state_root, id)?;
+        }
         // This may replace the process, so it runs before the runtime opens any resource.
-        let (delegated, id) = cgroups::enter_delegated_cgroup()?;
+        let (delegated, id) = cgroups::enter_delegated_cgroup(config.id.as_ref())?;
         // If a later step fails, dropping the state directory removes it again.
         let record = Record::creating(&id, config.bundle.clone(), config.annotations.clone());
         let state_dir = StateDir::create(state_root, &id, record)?;

@@ -2,6 +2,7 @@ use super::env_arg::build_env;
 use super::volume_arg::{default_workdir, parse_volume};
 use crate::cgroups::{CgroupSettings, CpuMax};
 use crate::config::{ContainerConfig, NetworkMode, ProcessConfig};
+use crate::container_id::ContainerId;
 use crate::paths;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -10,6 +11,11 @@ use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 pub struct RunArgs {
+    /// Container ID: 1 to 128 letters, digits, '_', '.', and '-' that start with a letter or
+    /// digit [default: 16 random hexadecimal digits].
+    #[arg(long, value_parser = ContainerId::parse)]
+    pub id: Option<ContainerId>,
+
     /// Rootfs directory [default: $XDG_DATA_HOME/agent-jail/images/default].
     #[arg(long)]
     pub rootfs: Option<PathBuf>,
@@ -87,6 +93,7 @@ impl RunArgs {
         args.extend(self.args);
 
         Ok(ContainerConfig {
+            id: self.id,
             rootfs,
             bundle,
             annotations: None,
@@ -155,6 +162,7 @@ mod tests {
     #[test]
     fn rejects_invalid_cpu_limits() {
         let mut args = RunArgs {
+            id: None,
             rootfs: Some(PathBuf::from("/")),
             cpus: 1.0,
             mem: 1,
@@ -177,6 +185,7 @@ mod tests {
     #[test]
     fn converts_cli_input_into_container_config() {
         let args = RunArgs {
+            id: Some(ContainerId::parse("box").unwrap()),
             rootfs: Some(PathBuf::from(".")),
             cpus: 1.0,
             mem: 1,
@@ -191,6 +200,7 @@ mod tests {
 
         let config = args.into_config().unwrap();
         assert_eq!(config.rootfs, PathBuf::from("."));
+        assert_eq!(config.id, ContainerId::parse("box").ok());
         assert_eq!(config.process.args, ["/bin/sh", "-c", "echo hello"]);
         assert!(config.process.env.contains(&String::from("HOME=/root")));
         assert_eq!(config.process.cwd, PathBuf::from("/"));

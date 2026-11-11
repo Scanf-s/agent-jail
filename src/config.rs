@@ -1,9 +1,12 @@
 use crate::cgroups::CgroupSettings;
+use crate::container_id::ContainerId;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Settings the runtime needs to create and run a container.
 pub struct ContainerConfig {
+    /// The ID that the user chose. Without it, the runtime generates one.
+    pub id: Option<ContainerId>,
     /// Rootfs path on the host. A relative path is resolved from the current working directory.
     pub rootfs: PathBuf,
     /// The absolute path that the OCI state reports as the bundle. `run` has no bundle, so it

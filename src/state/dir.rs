@@ -1,7 +1,7 @@
 use super::Record;
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow};
 use std::fs::{self, DirBuilder, File};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -42,7 +42,7 @@ impl StateDir {
         let path = root.join(id.as_str());
         match fs::create_dir(&path) {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                bail!("a container with ID {id} already exists in {root:?}")
+                return Err(in_use(root, id));
             }
             result => result.with_context(|| format!("create {path:?}"))?,
         }
@@ -57,6 +57,20 @@ impl StateDir {
         };
         dir.write()?;
         Ok(dir)
+    }
+
+    /// Fail if container `id` has a state directory under `root`.
+    ///
+    /// `create` makes the final check. This earlier one can run before the runtime runs itself
+    /// again in a systemd scope. Otherwise systemd-run could fail first, on the scope of the
+    /// container that uses the ID, with a message that does not name the cause.
+    pub fn check_unused(root: &Path, id: &ContainerId) -> Result<()> {
+        let path = root.join(id.as_str());
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Err(in_use(root, id)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("check {path:?}")),
+        }
     }
 
     /// Apply `change` to the record and write it to the state file.
@@ -97,6 +111,10 @@ impl Drop for StateDir {
 
 fn open(path: &Path) -> Result<File> {
     File::open(path).with_context(|| format!("open {path:?}"))
+}
+
+fn in_use(root: &Path, id: &ContainerId) -> anyhow::Error {
+    anyhow!("a container with ID {id} already exists in {root:?}")
 }
 
 #[cfg(test)]
@@ -155,6 +173,20 @@ mod tests {
 
         assert!(error.to_string().contains("already exists"), "{error:#}");
         assert_eq!(read(&first.path).oci.id(), "box1");
+    }
+
+    #[test]
+    fn checks_whether_an_id_is_unused() {
+        let root = TempRoot::new();
+        let id = ContainerId::parse("box1").unwrap();
+        StateDir::check_unused(&root.0, &id).unwrap();
+
+        let _dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
+
+        let error = StateDir::check_unused(&root.0, &id).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        let other = ContainerId::parse("box2").unwrap();
+        StateDir::check_unused(&root.0, &other).unwrap();
     }
 
     #[test]

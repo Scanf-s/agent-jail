@@ -57,6 +57,7 @@ impl Bundle {
         let resources = cgroup_settings(linux.resources().as_ref())?;
 
         Ok(ContainerConfig {
+            id: None,
             rootfs,
             bundle: self.path.clone(),
             annotations: spec.annotations().clone(),

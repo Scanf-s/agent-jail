@@ -35,17 +35,23 @@ impl Sandbox {
 
     /// Start `aj run` with `script` in its own process group, as a shell does for a job.
     fn spawn(&self, script: &str) -> Child {
-        self.spawn_program(&["/bin/sh", "-c", script])
+        self.spawn_with(&[], &["/bin/sh", "-c", script])
     }
 
     /// Start `aj run` with `program` and its arguments, as `spawn` does.
     fn spawn_program(&self, program: &[&str]) -> Child {
+        self.spawn_with(&[], program)
+    }
+
+    /// Start `aj run` with the options `run_args`, `program`, and its arguments.
+    fn spawn_with(&self, run_args: &[&str], program: &[&str]) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_aj"));
         command
             .env("XDG_DATA_HOME", self.root.join("data"))
             .arg("--root")
             .arg(self.root.join("state"))
             .arg("run")
+            .args(run_args)
             .arg("--net")
             .arg("none")
             .arg("--rootfs")
@@ -173,6 +179,45 @@ fn records_the_state_while_the_container_runs() {
     fs::write(sandbox.root.join("out/stop"), "").unwrap();
     assert_eq!(wait(&mut aj).code(), Some(0));
     assert_eq!(sandbox.states(), Vec::<Value>::new());
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn rejects_an_id_that_a_container_uses() {
+    let sandbox = Sandbox::new("same-id");
+    let wait_for_stop = "touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done";
+    let mut first = sandbox.spawn_with(&["--id", "box"], &["/bin/sh", "-c", wait_for_stop]);
+    sandbox.wait_until_ready();
+
+    let mut second = sandbox.spawn_with(&["--id", "box"], &["/bin/true"]);
+
+    assert_eq!(wait(&mut second).code(), Some(1));
+    let states = sandbox.states();
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["status"], "running");
+    fs::write(sandbox.root.join("out/stop"), "").unwrap();
+    assert_eq!(wait(&mut first).code(), Some(0));
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn accepts_an_id_that_looks_like_a_unit_name() {
+    let sandbox = Sandbox::new("unit-id");
+    let mut aj = sandbox.spawn_with(
+        &["--id", "web.service"],
+        &[
+            "/bin/sh",
+            "-c",
+            "touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done",
+        ],
+    );
+    sandbox.wait_until_ready();
+
+    let states = sandbox.states();
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["id"], "web.service");
+    fs::write(sandbox.root.join("out/stop"), "").unwrap();
+    assert_eq!(wait(&mut aj).code(), Some(0));
 }
 
 #[test]
