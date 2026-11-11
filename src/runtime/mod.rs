@@ -8,9 +8,11 @@ use crate::proc_stat;
 use crate::signals::{self, Event, RuntimeSignals};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::fcntl::OFlag;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sched::{CloneFlags, unshare};
+use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
@@ -48,7 +50,7 @@ impl Runtime {
             config.annotations.clone(),
         );
         let state_dir = StateDir::create(state_root, &id, record)?;
-        let run_dir = RunDir::create(&id)?;
+        let run_dir = RunDir::create(&id, cgroup.path())?;
 
         let channels = StartupChannels::new()?;
 
@@ -194,7 +196,7 @@ impl Runtime {
             }
             ForkResult::Child => {
                 drop(startup_reader);
-                if let Err(error) = self.run_init() {
+                if let Err(error) = self.run_init(&startup_writer) {
                     report!("aj: container init failed: {error:#}");
                     let _ = write(&startup_writer, &[1]);
                     std::process::exit(127);
@@ -231,7 +233,11 @@ impl Runtime {
         }
     }
 
-    fn run_init(&self) -> Result<()> {
+    /// Prepare the container and execute its program. `startup` is the write end of the startup
+    /// pipe.
+    fn run_init(&self, startup: &OwnedFd) -> Result<()> {
+        // The setup of the container can take a while, for example to mount the overlay.
+        end_with_monitor(startup)?;
         match self.config.network {
             // pasta has already brought lo up.
             NetworkMode::Pasta => {}
@@ -262,10 +268,31 @@ impl Runtime {
         setgroups(&groups).context("set supplementary groups")?;
         setgid(Gid::from_raw(process.gid))?;
         setuid(Uid::from_raw(process.uid))?;
+        // A change of the user clears the parent death signal.
+        end_with_monitor(startup)?;
 
         signals::reset_for_exec()?;
         container::exec(&process.args, &process.env)
     }
+}
+
+/// Make the kernel kill this process, container init, when the setup process ends.
+///
+/// The setup process waits for init and cleans up after it, so the container must not run
+/// without it. The program can still clear the setting, for example by changing its user. The
+/// cleanup of a later run ends such a container.
+///
+/// The setup process holds the only read end of the startup pipe `startup`. If it ended before
+/// the setting took effect, the read end is closed, and this fails.
+fn end_with_monitor(startup: &OwnedFd) -> Result<()> {
+    set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")?;
+    let mut fds = [PollFd::new(startup.as_fd(), PollFlags::empty())];
+    poll(&mut fds, PollTimeout::ZERO).context("poll the startup pipe")?;
+    let reader_closed = fds[0]
+        .revents()
+        .is_some_and(|events| events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP));
+    ensure!(!reader_closed, "the setup process has ended");
+    Ok(())
 }
 
 /// Wait until the setup process ends.

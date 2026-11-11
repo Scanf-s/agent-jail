@@ -183,6 +183,14 @@ fn only_child(pid: Pid) -> Pid {
     Pid::from_raw(children[0].parse().unwrap())
 }
 
+fn wait_until_ended(pid: Pid) {
+    let deadline = Instant::now() + TIMEOUT;
+    while is_running(pid) {
+        assert!(Instant::now() < deadline, "process {pid} still runs");
+        sleep(Duration::from_millis(20));
+    }
+}
+
 /// Whether `pid` runs. A zombie has ended and only waits for its parent to reap it.
 fn is_running(pid: Pid) -> bool {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -454,6 +462,58 @@ fn container_init_ends_when_only_the_setup_process_is_killed() {
     let mut next = sandbox.spawn("true");
     assert_eq!(wait(&mut next).code(), Some(0));
     assert_eq!(sandbox.run_dirs(), 0);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn container_init_ends_when_the_runtime_and_the_setup_process_are_killed() {
+    let sandbox = Sandbox::new("all-killed");
+    let mut aj = sandbox.spawn("touch /out/ready && exec sleep 60");
+    sandbox.wait_until_ready();
+    sandbox.wait_until_running();
+    let setup = only_child(Pid::from_raw(aj.id() as i32));
+    let init = only_child(setup);
+
+    // Without the runtime, nothing writes cgroup.kill after the setup process ends.
+    kill(Pid::from_raw(aj.id() as i32), Signal::SIGKILL).unwrap();
+    wait(&mut aj);
+    kill(setup, Signal::SIGKILL).unwrap();
+
+    wait_until_ended(init);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn the_next_run_ends_a_container_that_changed_its_user() {
+    let sandbox = Sandbox::new("changed-user");
+    // Changing the user clears the parent death signal of container init.
+    let mut aj = sandbox.spawn("touch /out/ready && exec su -s /bin/sh nobody -c 'exec sleep 60'");
+    sandbox.wait_until_ready();
+    let setup = only_child(Pid::from_raw(aj.id() as i32));
+    let init = only_child(setup);
+    let deadline = Instant::now() + TIMEOUT;
+    while fs::read_to_string(format!("/proc/{init}/comm")).unwrap() != "sleep\n" {
+        assert!(
+            Instant::now() < deadline,
+            "the program did not change its user"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    kill(Pid::from_raw(aj.id() as i32), Signal::SIGKILL).unwrap();
+    wait(&mut aj);
+    kill(setup, Signal::SIGKILL).unwrap();
+    sleep(Duration::from_millis(200));
+    assert!(
+        is_running(init),
+        "the parent death signal ended the program"
+    );
+
+    let mut next = sandbox.spawn("true");
+
+    assert_eq!(wait(&mut next).code(), Some(0));
+    wait_until_ended(init);
+    assert_eq!(sandbox.run_dirs(), 0);
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
 }
 
 #[test]

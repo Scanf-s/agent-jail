@@ -91,6 +91,46 @@ fn is_populated(events: &str) -> Result<bool> {
     }
 }
 
+/// Kill every process in the cgroup `path` and its descendants, and wait until they end. A
+/// cgroup that does not exist holds no process to kill.
+pub fn kill_all(path: &Path) -> Result<()> {
+    kill_all_within(path, KILL_TIMEOUT)
+}
+
+fn kill_all_within(path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let killed_by_kernel = write_kill_file(path)?;
+    loop {
+        if !holds_processes(path)? {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("processes in {path:?} did not end within {timeout:?}");
+        }
+        // Without cgroup.kill, a process can fork after the list was read, so this repeats.
+        if !killed_by_kernel {
+            kill_listed_processes(path)?;
+        }
+        sleep(Duration::from_millis(10));
+    }
+}
+
+/// Ask the kernel to kill every process in the cgroup `path`. Returns false if the kernel is
+/// older than Linux 5.14, which has no `cgroup.kill`.
+fn write_kill_file(path: &Path) -> Result<bool> {
+    let file = path.join("cgroup.kill");
+    // Without `create`, a missing file fails with NotFound instead of being created.
+    match OpenOptions::new().write(true).open(&file) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        result => {
+            result
+                .and_then(|mut opened| opened.write_all(b"1"))
+                .with_context(|| format!("write {file:?}"))?;
+            Ok(true)
+        }
+    }
+}
+
 /// Send SIGKILL to the processes in the cgroup `dir` and in its descendants.
 fn kill_listed_processes(dir: &Path) -> Result<()> {
     let procs = match fs::read_to_string(dir.join("cgroup.procs")) {
@@ -202,45 +242,10 @@ impl Cgroup {
     /// Kill every process in the cgroup and its descendants, and wait until they end.
     ///
     /// The setup process is in this cgroup, so the OOM killer can end it alone. Container init
-    /// then keeps running with no process that waits for it or cleans up after it.
+    /// can then keep running with no process that waits for it or cleans up after it, if the
+    /// program cleared its parent death signal.
     pub fn kill_all(&self) -> Result<()> {
-        self.kill_all_within(KILL_TIMEOUT)
-    }
-
-    fn kill_all_within(&self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let killed_by_kernel = self.write_kill_file()?;
-        loop {
-            if !holds_processes(&self.path)? {
-                return Ok(());
-            }
-            if Instant::now() > deadline {
-                bail!(
-                    "processes in {:?} did not end within {timeout:?}",
-                    self.path
-                );
-            }
-            // Without cgroup.kill, a process can fork after the list was read, so this repeats.
-            if !killed_by_kernel {
-                kill_listed_processes(&self.path)?;
-            }
-            sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Ask the kernel to kill every process in the cgroup. Returns false if the kernel is older
-    /// than Linux 5.14, which has no `cgroup.kill`.
-    fn write_kill_file(&self) -> Result<bool> {
-        let path = self.path.join("cgroup.kill");
-        // Without `create`, a missing file fails with NotFound instead of being created.
-        match OpenOptions::new().write(true).open(&path) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            file => {
-                file.and_then(|mut file| file.write_all(b"1"))
-                    .with_context(|| format!("write {path:?}"))?;
-                Ok(true)
-            }
-        }
+        kill_all(&self.path)
     }
 
     fn set_memory_max(&self, bytes: u64) -> Result<()> {
@@ -545,9 +550,7 @@ mod tests {
             path: temp.0.clone(),
         };
 
-        let error = cgroup
-            .kill_all_within(Duration::from_millis(50))
-            .unwrap_err();
+        let error = kill_all_within(&cgroup.path, Duration::from_millis(50)).unwrap_err();
 
         assert!(error.to_string().contains("did not end"), "{error:#}");
     }
