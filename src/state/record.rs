@@ -1,9 +1,14 @@
+use super::STATE_FILE;
 use crate::container_id::ContainerId;
 use crate::oci::SUPPORTED_OCI_VERSION;
+use crate::proc_stat;
+use anyhow::{Context, Result};
+use nix::unistd::Pid;
 use oci_spec::runtime::{ContainerState, State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The content of `state.json`: the OCI state of a container, and what the runtime needs to
@@ -56,6 +61,22 @@ impl Record {
             auto_delete: true,
         }
     }
+
+    /// Read the state file in the state directory `dir`.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let path = dir.join(STATE_FILE);
+        let json = fs::read(&path).with_context(|| format!("read {path:?}"))?;
+        serde_json::from_slice(&json).with_context(|| format!("parse {path:?}"))
+    }
+
+    /// Whether container init still runs. Before init runs the program, the record names no
+    /// init, so this returns false.
+    pub fn init_runs(&self) -> Result<bool> {
+        match (self.oci.pid(), self.init_start_time) {
+            (Some(pid), Some(start_time)) => proc_stat::is_running(Pid::from_raw(*pid), start_time),
+            _ => Ok(false),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +113,22 @@ mod tests {
                 "autoDelete": true,
             })
         );
+    }
+
+    #[test]
+    fn checks_init_by_its_pid_and_start_time() {
+        let mut record = record();
+        assert!(!record.init_runs().unwrap());
+
+        let this = Pid::this();
+        let start_time = proc_stat::start_time(this).unwrap();
+        record.oci.set_pid(Some(this.as_raw()));
+        record.init_start_time = Some(start_time);
+        assert!(record.init_runs().unwrap());
+
+        // A later process with the same PID has another start time.
+        record.init_start_time = Some(start_time + 1);
+        assert!(!record.init_runs().unwrap());
     }
 
     #[test]

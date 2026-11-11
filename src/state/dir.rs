@@ -1,4 +1,4 @@
-use super::Record;
+use super::{Record, STATE_FILE};
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
 use anyhow::{Context, Result, anyhow};
@@ -7,7 +7,6 @@ use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-const STATE_FILE: &str = "state.json";
 const TEMPORARY_FILE: &str = "state.json.tmp";
 
 /// The directory `<root>/<id>` that holds the state file of one container.
@@ -142,7 +141,7 @@ mod tests {
     }
 
     fn read(path: &Path) -> Record {
-        serde_json::from_slice(&fs::read(path.join(STATE_FILE)).unwrap()).unwrap()
+        Record::load(path).unwrap()
     }
 
     #[test]

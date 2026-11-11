@@ -299,6 +299,7 @@ fn container_init_ends_when_only_the_setup_process_is_killed() {
 
     assert_eq!(wait(&mut aj).code(), Some(137));
     assert!(!is_running(init), "container init outlived the runtime");
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
     // Only a process in the user namespace can remove the overlay's work directory, so the
     // next run removes the run directory.
     let mut next = sandbox.spawn("true");
@@ -315,9 +316,31 @@ fn the_next_run_removes_what_a_killed_run_left() {
     signal_group(&killed, Signal::SIGKILL);
     wait(&mut killed);
     assert_eq!(sandbox.run_dirs(), 1);
+    let states = sandbox.states();
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["status"], "running");
 
     let mut next = sandbox.spawn("true");
 
     assert_eq!(wait(&mut next).code(), Some(0));
     assert_eq!(sandbox.run_dirs(), 0);
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn a_killed_run_does_not_keep_its_id_in_use() {
+    let sandbox = Sandbox::new("reuse-id");
+    let mut killed = sandbox.spawn_with(
+        &["--id", "box"],
+        &["/bin/sh", "-c", "touch /out/ready && exec sleep 60"],
+    );
+    sandbox.wait_until_ready();
+    signal_group(&killed, Signal::SIGKILL);
+    wait(&mut killed);
+
+    let mut next = sandbox.spawn_with(&["--id", "box"], &["/bin/true"]);
+
+    assert_eq!(wait(&mut next).code(), Some(0));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
 }
