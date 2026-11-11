@@ -1,6 +1,7 @@
 use super::{Record, STATE_FILE};
 use crate::cgroups;
 use crate::flock::{LockKind, try_lock};
+use crate::paths;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::fs::{self, DirEntry, File};
@@ -80,11 +81,10 @@ fn find_stale(root: &Path) -> Result<Option<Scan>> {
 /// Lock and return the directory of `entry` if it is a stale state directory.
 fn lock_if_stale(entry: io::Result<DirEntry>) -> Result<Option<(PathBuf, File)>> {
     let entry = entry.context("read the state root")?;
-    // file_type does not follow symbolic links, so only real directories are removed.
-    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+    let path = entry.path();
+    if !paths::is_directory(&entry).with_context(|| format!("read {path:?}"))? {
         return Ok(None);
     }
-    let path = entry.path();
     let dir = match File::open(&path) {
         // The run removed its own directory after read_dir listed it.
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),

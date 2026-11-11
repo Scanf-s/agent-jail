@@ -1,6 +1,7 @@
 use super::Record;
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, try_lock};
+use crate::paths;
 use anyhow::{Context, Result, bail};
 use nix::libc;
 use oci_spec::runtime::ContainerState;
@@ -30,16 +31,20 @@ pub fn list(root: &Path) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("read {root:?}"))?;
-        // A directory that a runtime is creating has a temporary name, which is no valid ID.
-        let is_container = entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| ContainerId::parse(name).is_ok());
-        if !is_container {
-            continue;
-        }
         let dir = entry.path();
+        // A directory that a runtime is creating has a temporary name, which is no valid ID.
+        let is_id = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| ContainerId::parse(name).is_ok());
+        match paths::is_directory(&entry) {
+            Ok(true) if is_id => {}
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!("aj: warning: read {dir:?}: {error}");
+                continue;
+            }
+        }
         match Record::load(&dir).and_then(|record| with_current_status(&dir, record)) {
             Ok(record) => records.push(record),
             Err(error) if is_not_found(&error) => {}

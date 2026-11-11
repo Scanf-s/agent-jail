@@ -1,5 +1,7 @@
 use crate::container_id::ContainerId;
+use crate::paths;
 use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{AccessFlags, Pid, access};
 use std::fs::{self, OpenOptions};
@@ -99,13 +101,17 @@ fn kill_listed_processes(dir: &Path) -> Result<()> {
     };
     for pid in procs.split_whitespace() {
         let pid: i32 = pid.parse().with_context(|| format!("parse PID {pid:?}"))?;
-        // The process may end by itself after the read.
-        let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            // The process can end by itself after the read.
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(errno) => return Err(errno).with_context(|| format!("kill process {pid}")),
+        }
     }
     for entry in fs::read_dir(dir).with_context(|| format!("read {dir:?}"))? {
         let entry = entry.with_context(|| format!("read {dir:?}"))?;
-        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            kill_listed_processes(&entry.path())?;
+        let path = entry.path();
+        if paths::is_directory(&entry).with_context(|| format!("read {path:?}"))? {
+            kill_listed_processes(&path)?;
         }
     }
     Ok(())

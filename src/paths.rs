@@ -1,7 +1,20 @@
 use anyhow::{Context, Result, ensure};
 use nix::unistd::Uid;
 use std::ffi::OsString;
+use std::fs::DirEntry;
+use std::io;
 use std::path::{Path, PathBuf};
+
+/// Whether `entry` is a directory. A symbolic link to a directory is not one, so a cleanup never
+/// follows a link out of its own directory. An entry that was removed after `read_dir` listed it
+/// is none either.
+pub fn is_directory(entry: &DirEntry) -> io::Result<bool> {
+    match entry.file_type() {
+        Ok(kind) => Ok(kind.is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 
 /// The directory that holds one state directory for each container: `requested` from
 /// `--root`, or `$XDG_RUNTIME_DIR/agent-jail`.

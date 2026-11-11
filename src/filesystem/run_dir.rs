@@ -123,11 +123,10 @@ fn find_stale(runs: &Path) -> Result<Option<StaleRuns>> {
     let mut stale = Vec::new();
     for entry in fs::read_dir(runs).with_context(|| format!("read {runs:?}"))? {
         let entry = entry.with_context(|| format!("read {runs:?}"))?;
-        // file_type does not follow symbolic links, so only real directories are removed.
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        let path = entry.path();
+        if !paths::is_directory(&entry).with_context(|| format!("read {path:?}"))? {
             continue;
         }
-        let path = entry.path();
         let dir = match File::open(&path) {
             // The run removed its own directory after read_dir listed it.
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
