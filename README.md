@@ -1,151 +1,87 @@
 # agent-jail
 
-This project is for developers who do not want AI agents to fill their system with stray files and extra dependencies.
-It gives AI agents an isolated environment for their work, and it runs without root privileges.
+Run AI agents in Linux containers without root access.
+Files and packages added inside a container are deleted after each run.
+Changes to shared host files are kept.
 
 ## Requirements
 
-This project runs only on Linux. macOS support is planned for a later version.
+Linux is required. On macOS, use a Linux virtual machine.
 
-- cgroup v2. Debian 11 and later, and Ubuntu 22.04 and later, use cgroup v2 by default.
+- cgroup v2 and user namespaces enabled for users without root access.
+- systemd as PID 1, with a working user service manager.
+- `newuidmap` and `newgidmap` from the `uidmap` package.
+- At least 65536 subordinate IDs for your user in both `/etc/subuid` and `/etc/subgid`.
+- `pasta` from the `passt` package for network access.
+- Rust 1.85 or newer, Bash, `curl`, and `tar`.
 
-- Unprivileged user namespaces. Run `unshare -Ur id`, and the output must start with `uid=0(root)`.
-
-- `newuidmap` and `newgidmap` from the `uidmap` package. Run `command -v newuidmap newgidmap`, and the output must show both paths. On Debian or Ubuntu, install them with `sudo apt install uidmap`.
-
-- A range of at least 65536 IDs for your user in `/etc/subuid` and `/etc/subgid`. Run `grep "^$(id -un):" /etc/subuid /etc/subgid`, and each file must show a line such as `jace:100000:65536`. `useradd` usually adds these lines. If they are missing, add them with `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"`. Choose a range that no other user has.
-
-- `pasta` from the `passt` package, for network access in the container. Run `command -v pasta`, and the output must show its path. On Debian or Ubuntu, install it with `sudo apt install passt`. Without it, only `--net none` works.
-
-- systemd as PID 1 with a user instance for your user. Run `systemctl --user is-system-running`, and the output must be `running` or `degraded`. The runtime asks this instance for a cgroup that you can manage.
-
-- Rust 1.85 or newer, because the project uses the 2024 edition. The project was last checked with Rust 1.98.1.
-
-- `curl` and `tar`, because `scripts/fetch-rootfs.sh` downloads and extracts an Alpine minirootfs.
-
-## How to run
-
-### Run directly on the host
-
-1. Fetch the default rootfs into `~/.local/share/agent-jail/images/default`. If `XDG_DATA_HOME` is set, the script uses `$XDG_DATA_HOME/agent-jail/images/default` instead. The script skips the download if the directory already has contents.
+On Debian or Ubuntu, install the system packages:
 
 ```bash
-./scripts/fetch-rootfs.sh
+sudo apt install uidmap passt curl tar
 ```
 
-2. Build the binary.
+## Get started
 
-```bash
-cargo build --release
-```
+Run these commands in the project directory.
 
-3. Run the binary.
+1. Install `aj`. Make sure `~/.cargo/bin` is in your `PATH`.
 
-```bash
-./target/release/aj run --cpus 1.0 --mem 536870912 --pids 1024 -- /bin/sh
-```
+   ```bash
+   cargo install --path . --locked
+   ```
 
-To use another rootfs, fetch it into a directory of your choice and pass that directory with `--rootfs`.
+2. Download the container's base files (rootfs).
 
-```bash
-./scripts/fetch-rootfs.sh ./rootfs
-./target/release/aj run --rootfs ./rootfs -- /bin/sh
-```
+   ```bash
+   ./scripts/fetch-rootfs.sh
+   ```
 
-### Work on a host project
+3. Start a shell.
 
-Each run starts from the rootfs and writes its changes to a separate directory under `~/.local/share/agent-jail/runs`. Packages that a run installs therefore never change the rootfs. The runtime removes the directory when the run ends.
+   ```bash
+   aj run -- /bin/sh
+   ```
 
-Use `-v HOST[:CONTAINER][:ro]` to make a host file or directory visible in the container.
+Install any tools you need inside the container. They are removed when the run ends.
 
-Without `CONTAINER`, the container path is the same as the host path.
+## Common options
 
-Add `:ro` to make it read-only. 
-
-Use `-w` to choose the working directory. Without `-w`, the program starts in your current directory if a volume contains it, and in `/` otherwise.
-
-```bash
-cd ~/my-project
-aj run -v . -- make test
-aj run -v ./data:/data:ro -w /data -- ls
-aj run -v . -- /bin/sh -c 'make && make test'
-```
-
-Programs in the container can read their own limits in `/sys/fs/cgroup`, for example `memory.max`, `cpu.max`, and `pids.max`.
-
-### Environment variables
-
-The container does not receive the host's environment, because it often holds secrets such as API keys.
-By default, the program receives only these variables:
-
-| Variable | Value |
+| Option | Purpose |
 | --- | --- |
-| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
-| `HOME` | `/root` |
-| `TERM` | The host's value, if it is set |
-| `http_proxy`, `https_proxy`, `no_proxy`, and their uppercase forms | The host's values, if they are set |
+| `-v HOST[:CONTAINER][:ro]` | Share a host file or directory. Add `:ro` for read-only access. |
+| `-w /path` | Choose the working directory inside the container. |
+| `--env KEY=VALUE` | Set an environment variable. Use `--env KEY` to copy a host value. |
+| `--net none` | Block outside network access. |
+| `--rootfs DIRECTORY` | Use another rootfs. |
 
-Use `--env KEY=VALUE` to set a variable, and `--env KEY` to copy the host's value.
-If the host does not set `KEY`, the container does not get it.
-`--env` can be repeated, and it overrides the defaults.
-
-`LANG` is not copied, because the rootfs may not have the host's locale.
-If a program needs a locale, set one that every rootfs has.
+Share the current directory:
 
 ```bash
-aj run --env LANG=C.UTF-8 -- python3 app.py
-aj run --env GITHUB_TOKEN -v . -- gh pr list
+aj run -v . -- /bin/sh
 ```
 
-### Network
+Without a container path, shared files use the same path as on the host.
+Commands start in your current directory if it is shared, or in `/` otherwise.
 
-Use `--net` to choose the network mode.
+Default limits: 1 CPU, 512 MiB of memory, and 1024 tasks (processes and threads).
+Change them with `--cpus`, `--mem` (bytes), and `--pids`.
+See `aj run --help` for all options.
 
-| Mode | What the container can reach |
-| --- | --- |
-| `pasta` (default) | The internet, and its own servers through `localhost`. The runtime writes `/etc/resolv.conf` unless a volume covers it. |
-| `none` | Only its own servers through `localhost`. Use it for work that must stay offline. |
+## Environment and network
 
-```bash
-aj run -- apk add python3
-aj run --net none -v . -- make test
-```
+Only `TERM` and proxy variables (`http_proxy`, `https_proxy`, `no_proxy`, and their uppercase forms) are copied from the host.
+Use `--env` for other variables.
 
-In `pasta` mode, the container cannot reach host services that listen only on `127.0.0.1`.
-It can reach host services that listen on other host addresses, including `0.0.0.0`, for example through a Docker bridge address.
-Run development services on the host with `127.0.0.1` if the container must not reach them.
+Internet access is enabled by default through `pasta`. Without `pasta`, use `--net none`.
+The container may reach host services, except those listening only on `127.0.0.1`.
+The host cannot connect to servers inside the container.
 
-The host cannot reach servers in the container yet.
+## OCI bundles
 
-`run-bundle` always uses `none`.
+Use `aj run-bundle DIRECTORY` to run an OCI bundle without outside network access.
+Only some OCI 1.3.0 settings are supported. See the [example configuration](examples/oci-bundle/config.json).
 
-### Run with an OCI bundle
+## Development
 
-The `run-bundle` command reads `config.json` from a bundle directory and runs the program that the file describes.
-
-Like `run`, it waits until the program finishes.
-
-1. Fetch the rootfs into the example bundle.
-
-```bash
-./scripts/fetch-rootfs.sh ./examples/oci-bundle/rootfs
-```
-
-2. Run the example bundle.
-
-```bash
-./target/release/aj run-bundle ./examples/oci-bundle
-```
-
-The program prints `OCI_STARTED`, its working directory, its user, and its environment.
-
-The environment contains only the entries in `process.env`.
-
-### Development commands
-
-The Makefile has only formatting and linting targets.
-
-```bash
-make fmt    # cargo fmt
-make lint   # cargo clippy --all-features
-```
+Use `make fmt` to format the code and `make lint` to check it with Clippy.
