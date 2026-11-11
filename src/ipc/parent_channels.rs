@@ -8,6 +8,7 @@ pub(crate) struct ParentChannels {
     mapping_writer: Option<OwnedFd>,
     network_namespace_reader: Option<OwnedFd>,
     network_writer: Option<OwnedFd>,
+    created_reader: Option<OwnedFd>,
 }
 
 impl ParentChannels {
@@ -17,6 +18,7 @@ impl ParentChannels {
         mapping_writer: OwnedFd,
         network_namespace_reader: OwnedFd,
         network_writer: OwnedFd,
+        created_reader: OwnedFd,
     ) -> Self {
         Self {
             cgroup_writer: Some(cgroup_writer),
@@ -24,6 +26,7 @@ impl ParentChannels {
             mapping_writer: Some(mapping_writer),
             network_namespace_reader: Some(network_namespace_reader),
             network_writer: Some(network_writer),
+            created_reader: Some(created_reader),
         }
     }
 
@@ -70,5 +73,13 @@ impl ParentChannels {
             .take()
             .context("network already signaled")?;
         send_ready(&fd, "network")
+    }
+
+    // the pipe on which the child signals that the container is created. The parent waits for
+    // it together with signals, so it reads the pipe itself.
+    pub(crate) fn take_created_reader(&mut self) -> Result<OwnedFd> {
+        self.created_reader
+            .take()
+            .context("created pipe already taken")
     }
 }

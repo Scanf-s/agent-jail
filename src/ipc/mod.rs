@@ -2,17 +2,19 @@
 //!
 //! Parent -> child: cgroup ready. Child -> parent: user namespace ready.
 //! Parent -> child: UID/GID mapping ready. Child -> parent: network namespace ready.
-//! Parent -> child: network ready.
+//! Parent -> child: network ready. Child -> parent: container created.
+//!
+//! The pipes are close-on-exec, so neither pasta nor the container program receives them.
 
 mod child_channels;
 mod parent_channels;
 mod startup_channels;
 
-use child_channels::ChildChannels;
+pub(crate) use child_channels::ChildChannels;
 use parent_channels::ParentChannels;
 pub(crate) use startup_channels::StartupChannels;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::errno::Errno;
 use nix::unistd::{read, write};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -32,12 +34,21 @@ pub(crate) fn send_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
 }
 
 pub(crate) fn wait_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
+    ensure!(
+        read_ready(fd, stage)?,
+        "peer closed {stage} pipe before signaling"
+    );
+    Ok(())
+}
+
+/// Like `wait_ready`, but return false if the peer closed the pipe before it signaled.
+pub(crate) fn read_ready(fd: &OwnedFd, stage: &str) -> Result<bool> {
     let mut byte = [0u8; 1];
     loop {
         match read(fd.as_raw_fd(), &mut byte) {
-            Ok(1) if byte[0] == READY => return Ok(()),
+            Ok(1) if byte[0] == READY => return Ok(true),
             Ok(1) => bail!("unexpected {stage} signal: {}", byte[0]),
-            Ok(0) => bail!("peer closed {stage} pipe before signaling"),
+            Ok(0) => return Ok(false),
             Ok(count) => bail!("read {count} bytes for {stage}; expected one"),
             // Retry if an OS signal interrupts the read() systemcall, before reading something
             Err(Errno::EINTR) => continue,

@@ -467,6 +467,41 @@ fn container_init_ends_when_only_the_setup_process_is_killed() {
 
 #[test]
 #[ignore = "starts a container"]
+fn moves_the_setup_process_out_of_the_container_cgroup() {
+    let sandbox = Sandbox::new("setup-cgroup");
+    let mut aj = sandbox.spawn("touch /out/ready && exec sleep 60");
+    sandbox.wait_until_ready();
+    sandbox.wait_until_running();
+    let setup = only_child(Pid::from_raw(aj.id() as i32));
+    let init = only_child(setup);
+
+    // The runtime moves the setup process after init exists, which can take a moment.
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let cgroup = fs::read_to_string(format!("/proc/{setup}/cgroup")).unwrap();
+        if cgroup.trim_end().ends_with("/runtime") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the setup process stays in {cgroup}"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    let container = PathBuf::from(sandbox.states()[0]["cgroup"].as_str().unwrap());
+    let procs = fs::read_to_string(container.join("cgroup.procs")).unwrap();
+    assert_eq!(
+        procs.split_whitespace().collect::<Vec<_>>(),
+        [init.to_string()]
+    );
+
+    kill(Pid::from_raw(aj.id() as i32), Signal::SIGTERM).unwrap();
+    assert_eq!(wait(&mut aj).code(), Some(143));
+    assert_eq!(sandbox.run_dirs(), 0);
+}
+
+#[test]
+#[ignore = "starts a container"]
 fn container_init_ends_when_the_runtime_and_the_setup_process_are_killed() {
     let sandbox = Sandbox::new("all-killed");
     let mut aj = sandbox.spawn("touch /out/ready && exec sleep 60");

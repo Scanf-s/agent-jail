@@ -234,6 +234,13 @@ impl Cgroup {
         &self.path
     }
 
+    /// Move `pid` from this cgroup into the cgroup of the runtime.
+    pub fn move_to_runtime(&self, pid: Pid) -> Result<()> {
+        let leaf = self.path.with_file_name(RUNTIME_LEAF);
+        fs::write(leaf.join("cgroup.procs"), pid.to_string())
+            .with_context(|| format!("move process {pid} into {leaf:?}"))
+    }
+
     pub fn add_pid(&self, pid: nix::unistd::Pid) -> Result<()> {
         fs::write(self.path.join("cgroup.procs"), pid.to_string()).context("write cgroup.procs")?;
         Ok(())
@@ -241,9 +248,9 @@ impl Cgroup {
 
     /// Kill every process in the cgroup and its descendants, and wait until they end.
     ///
-    /// The setup process is in this cgroup, so the OOM killer can end it alone. Container init
-    /// can then keep running with no process that waits for it or cleans up after it, if the
-    /// program cleared its parent death signal.
+    /// If the setup process ended first, for example on SIGKILL, container init can keep running
+    /// with no process that waits for it or cleans up after it, when the program cleared its
+    /// parent death signal.
     pub fn kill_all(&self) -> Result<()> {
         kill_all(&self.path)
     }
@@ -553,6 +560,20 @@ mod tests {
         let error = kill_all_within(&cgroup.path, Duration::from_millis(50)).unwrap_err();
 
         assert!(error.to_string().contains("did not end"), "{error:#}");
+    }
+
+    #[test]
+    fn moves_a_process_into_the_cgroup_of_the_runtime() {
+        let temp = TempDir::new();
+        fs::create_dir(temp.0.join(RUNTIME_LEAF)).unwrap();
+        let cgroup = Cgroup {
+            path: temp.0.join("jail_box"),
+        };
+
+        cgroup.move_to_runtime(Pid::from_raw(42)).unwrap();
+
+        let procs = temp.0.join(RUNTIME_LEAF).join("cgroup.procs");
+        assert_eq!(fs::read_to_string(procs).unwrap(), "42");
     }
 
     #[test]

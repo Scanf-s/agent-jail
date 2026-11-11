@@ -8,6 +8,7 @@ pub(crate) struct ChildChannels {
     mapping_reader: Option<OwnedFd>,
     network_namespace_writer: Option<OwnedFd>,
     network_reader: Option<OwnedFd>,
+    created_writer: Option<OwnedFd>,
 }
 
 impl ChildChannels {
@@ -17,6 +18,7 @@ impl ChildChannels {
         mapping_reader: OwnedFd,
         network_namespace_writer: OwnedFd,
         network_reader: OwnedFd,
+        created_writer: OwnedFd,
     ) -> Self {
         Self {
             cgroup_reader: Some(cgroup_reader),
@@ -24,6 +26,7 @@ impl ChildChannels {
             mapping_reader: Some(mapping_reader),
             network_namespace_writer: Some(network_namespace_writer),
             network_reader: Some(network_reader),
+            created_writer: Some(created_writer),
         }
     }
 
@@ -70,5 +73,14 @@ impl ChildChannels {
             .take()
             .context("network already checked")?;
         wait_ready(&fd, "network")
+    }
+
+    // signal to the parent that the container is created
+    pub(crate) fn signal_created(&mut self) -> Result<()> {
+        let fd = self
+            .created_writer
+            .take()
+            .context("created already signaled")?;
+        send_ready(&fd, "created")
     }
 }
