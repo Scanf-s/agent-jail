@@ -6,6 +6,7 @@ It gives AI agents an isolated environment for their work, and it runs without r
 ## Requirements
 
 This project runs only on Linux. macOS support is planned for a later version.
+To develop on macOS, see [Develop on macOS](#develop-on-macos).
 
 - cgroup v2. Debian 11 and later, and Ubuntu 22.04 and later, use cgroup v2 by default.
 
@@ -149,3 +150,105 @@ The Makefile has only formatting and linting targets.
 make fmt    # cargo fmt
 make lint   # cargo clippy --all-features
 ```
+
+## Develop on macOS
+
+The runtime uses Linux kernel features, so it does not build or run on macOS.
+On macOS, edit the code as usual, and build and run it in a Linux VM.
+
+These steps use [Lima](https://lima-vm.io), which runs a Linux VM and shares your macOS home directory with it.
+The steps were last checked with Lima 2.3.0 and a Debian 13 VM on an Apple silicon Mac.
+They use Debian 13 because Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor by default.
+
+### Set up the VM
+
+1. Install Lima.
+
+```bash
+brew install lima
+```
+
+2. Create and start a Debian 13 VM named `aj`.
+
+```bash
+limactl start --name=aj template:debian-13
+```
+
+3. Update the package lists in the VM.
+
+```bash
+limactl shell aj sudo apt-get update
+```
+
+4. Install a C toolchain and `pasta` in the VM.
+
+```bash
+limactl shell aj sudo apt-get install -y build-essential passt
+```
+
+5. Install Rust in the VM.
+
+```bash
+limactl shell aj sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+```
+
+6. Make Cargo write its build output in the VM. This keeps Linux build files out of the `target` directory on macOS.
+
+```bash
+limactl shell aj sh -c 'echo "export CARGO_TARGET_DIR=\$HOME/target" >> ~/.profile'
+```
+
+7. Go to the project directory on macOS.
+
+```bash
+cd ~/path/to/agent-jail
+```
+
+8. Fetch the default rootfs into the VM.
+
+```bash
+limactl shell aj ./scripts/fetch-rootfs.sh
+```
+
+To check the other requirements, open a shell in the VM with `limactl shell aj`, and run the commands in [Requirements](#requirements).
+
+### Build and run in the VM
+
+Edit the code on macOS.
+Run commands in the VM from the project directory on macOS, with `limactl shell aj` in front of each command.
+`limactl shell` runs the command in the same directory in the VM.
+
+```bash
+limactl shell aj cargo test
+limactl shell aj cargo clippy --all-features
+limactl shell aj cargo run --release -- run -- /bin/sh
+```
+
+Do not use `~` in these commands, because the macOS shell replaces it with your macOS home directory before the VM gets the command.
+To use a path in the VM's home directory, put the command in `sh -c '...'`.
+
+Run `limactl shell aj` to open a shell in the VM.
+Run `limactl stop aj` to stop the VM, and `limactl start aj` to start it again.
+
+### Limits of the shared home directory
+
+- The VM can read your macOS home directory, but it cannot write to it. So containers that you test cannot change your macOS files.
+- Run `make fmt` on macOS, because it writes to the source files.
+- A volume from the shared home directory is read-only in the container, even without `:ro`. To test a writable volume, use a directory in the VM's home directory.
+- The VM has its own home directory, so the rootfs and the run directories are stored in the VM.
+
+### Check the code on macOS
+
+Without a Linux target, editors and `cargo check` on macOS report errors for Linux-only code.
+To check the code on macOS without the VM, add a Linux target.
+On an Intel Mac, use `x86_64-unknown-linux-gnu` instead of `aarch64-unknown-linux-gnu`.
+
+```bash
+rustup target add aarch64-unknown-linux-gnu
+cargo check --all-targets --target aarch64-unknown-linux-gnu
+```
+
+`cargo check` and `cargo clippy` work with this target.
+`cargo build` and `cargo test` do not work, because macOS cannot link Linux binaries.
+
+For rust-analyzer, set `rust-analyzer.cargo.target` to the same target.
