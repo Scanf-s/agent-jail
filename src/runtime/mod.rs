@@ -204,9 +204,9 @@ impl Runtime {
         }
     }
 
-    /// Record that container init `init` runs the container program.
     fn record_running(&mut self, init: Pid) {
-        let result = proc_stat::start_time(init).and_then(|start_time| {
+        let result = (|| -> Result<()> {
+            let start_time = proc_stat::start_time(init)?;
             self.state_dir.update(|record| {
                 record
                     .oci
@@ -214,7 +214,7 @@ impl Runtime {
                     .set_pid(Some(init.as_raw()));
                 record.init_start_time = Some(start_time);
             })
-        });
+        })();
         if let Err(error) = result {
             eprintln!("aj: warning: record that the container runs: {error:#}");
         }
@@ -337,18 +337,15 @@ fn wait_for_init(
         let signal = match event {
             Event::Signal(signal) => signal,
             Event::Readable => {
-                if let Some(pipe) = startup.take()
-                    && exec_succeeded(&pipe)?
-                {
-                    // An init that ends before exec without writing, for example on SIGKILL,
-                    // also closes the pipe. Only an init that still runs has run the program.
-                    match waitpid(init, Some(WaitPidFlag::WNOHANG))
-                        .context("waitpid(init) failed")?
-                    {
-                        WaitStatus::StillAlive => on_running(),
-                        status => {
-                            return exit_code_with_termination_signal(status, termination_signal);
-                        }
+                let Some(pipe) = startup.take() else {
+                    continue;
+                };
+                match read_startup(init, &pipe)? {
+                    Startup::Running => on_running(),
+                    // Init is ending, and its SIGCHLD ends this loop.
+                    Startup::Failed => {}
+                    Startup::Ended(status) => {
+                        return exit_code_with_termination_signal(status, termination_signal);
                     }
                 }
                 continue;
@@ -385,12 +382,28 @@ fn wait_for_init(
     }
 }
 
-/// Whether the startup pipe shows a successful exec: EOF without the byte that init writes when
-/// it fails.
-fn exec_succeeded(startup: &OwnedFd) -> Result<bool> {
+/// What the startup pipe showed about container init.
+enum Startup {
+    /// Init executed the container program.
+    Running,
+    /// Init failed before it executed the program, and it is ending.
+    Failed,
+    /// Init ended before it executed the program, with this status.
+    Ended(WaitStatus),
+}
+
+/// Read the startup pipe of `init` after it became readable.
+fn read_startup(init: Pid, startup: &OwnedFd) -> Result<Startup> {
     let mut byte = [0];
-    let count = read(startup.as_raw_fd(), &mut byte).context("read the startup pipe")?;
-    Ok(count == 0)
+    if read(startup.as_raw_fd(), &mut byte).context("read the startup pipe")? > 0 {
+        return Ok(Startup::Failed);
+    }
+    // A successful exec closes the write end. So does an init that ends before exec without
+    // writing, for example on SIGKILL. Only an init that still runs has run the program.
+    match waitpid(init, Some(WaitPidFlag::WNOHANG)).context("waitpid(init) failed")? {
+        WaitStatus::StillAlive => Ok(Startup::Running),
+        status => Ok(Startup::Ended(status)),
+    }
 }
 
 /// Like `exit_status`, but if the runtime killed init for a termination signal, the code shows
