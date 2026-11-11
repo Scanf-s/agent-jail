@@ -8,7 +8,7 @@ use crate::proc_stat;
 use crate::signals::{self, Event, RuntimeSignals};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
@@ -175,13 +175,24 @@ impl Runtime {
     }
 
     fn launch_init(&mut self, signals: &RuntimeSignals) -> Result<()> {
-        let (channel, mut init_channel) = startup::channel()?;
+        let (channel, init_channel) = startup::channel()?;
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
                 drop(init_channel);
-                let code = supervise(child, signals, channel, |report| match report {
-                    Report::Closed => self.record_running(child),
-                    Report::Failed(message) => report!("aj: container init failed: {message}"),
+                let code = supervise(child, signals, channel, |startup| match startup {
+                    // A created container must report the PID of init, so the program does
+                    // not start without the record.
+                    Startup::Created => self.record_created(child),
+                    Startup::Running => {
+                        if let Err(error) = self.record_running() {
+                            report!("aj: warning: {error:#}");
+                        }
+                        Ok(())
+                    }
+                    Startup::Failed(message) => {
+                        report!("aj: container init failed: {message}");
+                        Ok(())
+                    }
                 });
                 self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
@@ -193,9 +204,13 @@ impl Runtime {
             }
             ForkResult::Child => {
                 drop(channel);
+                // The locks show that a runtime process is alive. Init is not one, and it can
+                // wait for the start of the program for a long time.
+                self.state_dir.close_lock();
+                self.run_dir.close_lock();
                 if let Err(error) = self.run_init(&init_channel) {
                     // The setup process prints the error.
-                    let _ = startup::send_failure(&mut init_channel, &error);
+                    let _ = startup::send_failure(&init_channel, &error);
                     std::process::exit(127);
                 }
                 unreachable!("container init returned without executing command");
@@ -203,20 +218,26 @@ impl Runtime {
         }
     }
 
-    fn record_running(&mut self, init: Pid) {
-        let result = (|| -> Result<()> {
-            let start_time = proc_stat::start_time(init)?;
-            self.state_dir.update(|record| {
+    /// Record that container init is ready to execute the program.
+    fn record_created(&mut self, init: Pid) -> Result<()> {
+        let start_time = proc_stat::start_time(init)?;
+        self.state_dir
+            .update(|record| {
                 record
                     .oci
-                    .set_status(ContainerState::Running)
+                    .set_status(ContainerState::Created)
                     .set_pid(Some(init.as_raw()));
                 record.init_start_time = Some(start_time);
             })
-        })();
-        if let Err(error) = result {
-            report!("aj: warning: record that the container runs: {error:#}");
-        }
+            .context("record that the container is created")
+    }
+
+    fn record_running(&mut self) -> Result<()> {
+        self.state_dir
+            .update(|record| {
+                record.oci.set_status(ContainerState::Running);
+            })
+            .context("record that the container runs")
     }
 
     /// Record that the container program ended, with its exit code if the runtime knows it.
@@ -234,7 +255,7 @@ impl Runtime {
     /// channel that init keeps.
     fn run_init(&self, startup: &UnixStream) -> Result<()> {
         // The setup of the container can take a while, for example to mount the overlay.
-        end_with_monitor(startup)?;
+        end_with_monitor()?;
         match self.config.network {
             // pasta has already brought lo up.
             NetworkMode::Pasta => {}
@@ -266,7 +287,8 @@ impl Runtime {
         setgid(Gid::from_raw(process.gid))?;
         setuid(Uid::from_raw(process.uid))?;
         // A change of the user clears the parent death signal.
-        end_with_monitor(startup)?;
+        end_with_monitor()?;
+        startup::wait_for_start(startup)?;
 
         signals::reset_for_exec()?;
         container::exec(&process.args, &process.env)
@@ -279,15 +301,10 @@ impl Runtime {
 /// without it. The program can still clear the setting, for example by changing its user. The
 /// cleanup of a later run ends such a container.
 ///
-/// The setup process holds the other end of the startup channel `startup`. If it ended before
-/// the setting took effect, that end is closed, and this fails.
-fn end_with_monitor(startup: &UnixStream) -> Result<()> {
-    set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")?;
-    ensure!(
-        !startup::peer_closed(startup)?,
-        "the setup process has ended"
-    );
-    Ok(())
+/// If the setup process ends before the setting takes effect, init finds the startup channel
+/// closed when it waits for the start of the program.
+fn end_with_monitor() -> Result<()> {
+    set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")
 }
 
 /// Wait until the setup process ends.
@@ -320,19 +337,30 @@ fn wait_for_setup_process(child: Pid, signals: &RuntimeSignals) -> Result<WaitSt
     }
 }
 
+/// What container init did before its program ran.
+enum Startup {
+    /// Init is ready to execute the program.
+    Created,
+    /// Init executed the program.
+    Running,
+    /// Init cannot run the program, for this reason.
+    Failed(String),
+}
+
 /// Wait until container init ends, and return the exit code for the runtime.
 ///
 /// `channel` is the end of the startup channel that the setup process keeps. This passes what
-/// init reports through it to `on_report`.
+/// init does before its program runs to `on_startup`, and starts the program after
+/// `on_startup` accepted `Startup::Created`.
 ///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
 fn supervise(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
-    on_report: impl FnMut(Report),
+    on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
-    let result = wait_for_init(init, signals, channel, on_report);
+    let result = wait_for_init(init, signals, channel, on_startup);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -344,9 +372,11 @@ fn wait_for_init(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
-    mut on_report: impl FnMut(Report),
+    mut on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
     let mut channel = Some(channel);
+    // Whether init was told to execute the program.
+    let mut started = false;
     // The termination signal for which the runtime killed init.
     let mut termination_signal = None;
     loop {
@@ -359,8 +389,21 @@ fn wait_for_init(
         let signal = match event {
             Event::Signal(signal) => signal,
             Event::Readable => {
-                if let Some(mut open) = channel.take() {
-                    on_report(startup::read_report(&mut open)?);
+                let Some(open) = &channel else {
+                    continue;
+                };
+                match startup::read_report(open)? {
+                    Report::Ready => {
+                        on_startup(Startup::Created)?;
+                        startup::start(open)?;
+                        started = true;
+                    }
+                    report => {
+                        channel = None;
+                        if let Some(startup) = conclusion(report, started) {
+                            on_startup(startup)?;
+                        }
+                    }
                 }
                 continue;
             }
@@ -371,9 +414,20 @@ fn wait_for_init(
                     continue;
                 }
                 // Init can report and end before this loop reads the report. Its end of the
-                // channel closed when it ended, so this read does not block.
-                if let Some(mut open) = channel.take() {
-                    on_report(startup::read_report(&mut open)?);
+                // channel closed when it ended, so these reads do not block.
+                if let Some(open) = channel.take() {
+                    loop {
+                        match startup::read_report(&open)? {
+                            // The program cannot start any more.
+                            Report::Ready => {}
+                            report => {
+                                if let Some(startup) = conclusion(report, started) {
+                                    on_startup(startup)?;
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 let status = waitpid(init, None).context("waitpid(init) failed")?;
                 return exit_code_with_termination_signal(status, termination_signal);
@@ -399,6 +453,20 @@ fn wait_for_init(
                 }
             }
         }
+    }
+}
+
+/// What the last report of init on the startup channel shows, if `started` tells whether init
+/// was told to execute the program.
+fn conclusion(report: Report, started: bool) -> Option<Startup> {
+    match report {
+        Report::Ready => None,
+        // After the start, init closes its end when the exec succeeds. The program may have
+        // ended already, as /bin/true does.
+        Report::Closed if started => Some(Startup::Running),
+        // Init ended before it could run the program, for example on SIGKILL.
+        Report::Closed => None,
+        Report::Failed(message) => Some(Startup::Failed(message)),
     }
 }
 

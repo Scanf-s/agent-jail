@@ -21,7 +21,7 @@ pub struct RunDir {
     // An exclusive flock on the directory shows that the run is alive. The forked processes
     // share this open file, and the kernel releases the lock when the last of them closes it or
     // ends, even when they are killed. `remove_stale` removes only directories whose lock is free.
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl RunDir {
@@ -50,7 +50,10 @@ impl RunDir {
             .with_context(|| format!("lock {path:?}"))?
             .with_context(|| format!("another process holds the lock of {path:?}"))?;
 
-        let run_dir = Self { path, _lock: lock };
+        let run_dir = Self {
+            path,
+            _lock: Some(lock),
+        };
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             fs::create_dir(&dir).with_context(|| format!("create {dir:?}"))?;
         }
@@ -58,6 +61,12 @@ impl RunDir {
         fs::write(&file, cgroup.as_os_str().as_bytes())
             .with_context(|| format!("write {file:?}"))?;
         Ok(run_dir)
+    }
+
+    /// Close the lock in this process, which is no runtime process: container init before it
+    /// executes the program.
+    pub fn close_lock(&mut self) {
+        self._lock = None;
     }
 
     /// The overlay's upper directory, which receives every change in the container.
