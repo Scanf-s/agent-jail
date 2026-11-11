@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use super::RunArgs;
+use crate::container_id::ContainerId;
 
 /// Top-level parsed CLI command.
 #[derive(Parser, Debug)]
@@ -30,6 +31,14 @@ pub enum Command {
         /// Path to the bundle directory that contains config.json.
         bundle: PathBuf,
     },
+    /// Print the OCI state of a container as JSON.
+    State {
+        /// Container ID.
+        #[arg(value_parser = ContainerId::parse)]
+        id: ContainerId,
+    },
+    /// List the containers that are running or that a killed run left behind.
+    List,
 }
 
 #[cfg(test)]
@@ -125,6 +134,21 @@ mod tests {
             error.to_string().contains("invalid container ID"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn parses_state_and_list() {
+        let cli = Cli::try_parse_from(["aj", "state", "box"]).unwrap();
+        let Command::State { id } = cli.command else {
+            panic!("expected the state command");
+        };
+        assert_eq!(id.as_str(), "box");
+        assert!(Cli::try_parse_from(["aj", "state"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "state", ".."]).is_err());
+
+        let cli = Cli::try_parse_from(["aj", "--root", "/state", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::List));
+        assert_eq!(cli.root, Some(PathBuf::from("/state")));
     }
 
     #[test]

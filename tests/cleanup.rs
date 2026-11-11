@@ -7,11 +7,11 @@
 
 use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::Pid;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,17 @@ impl Sandbox {
             });
         }
         command.spawn().unwrap()
+    }
+
+    /// Run `aj` with `args` against the state directories of this sandbox, and wait for it.
+    fn aj(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_aj"))
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .arg("--root")
+            .arg(self.root.join("state"))
+            .args(args)
+            .output()
+            .unwrap()
     }
 
     fn wait_until_ready(&self) {
@@ -179,6 +190,53 @@ fn records_the_state_while_the_container_runs() {
     fs::write(sandbox.root.join("out/stop"), "").unwrap();
     assert_eq!(wait(&mut aj).code(), Some(0));
     assert_eq!(sandbox.states(), Vec::<Value>::new());
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn state_and_list_report_a_running_and_a_killed_container() {
+    let sandbox = Sandbox::new("state-list");
+    let mut aj = sandbox.spawn_with(
+        &["--id", "box"],
+        &["/bin/sh", "-c", "touch /out/ready && exec sleep 60"],
+    );
+    sandbox.wait_until_ready();
+    let init = only_child(only_child(Pid::from_raw(aj.id() as i32)));
+
+    let state: Value = serde_json::from_slice(&sandbox.aj(&["state", "box"]).stdout).unwrap();
+    assert_eq!(
+        state,
+        json!({
+            "ociVersion": "1.3.0",
+            "id": "box",
+            "status": "running",
+            "pid": init.as_raw(),
+            "bundle": rootfs(),
+        })
+    );
+    let list = String::from_utf8(sandbox.aj(&["list"]).stdout).unwrap();
+    let row = format!("box  {:<7}  running ", init.as_raw());
+    assert!(list.lines().nth(1).unwrap().starts_with(&row), "{list}");
+
+    // A killed runtime leaves running in the state file.
+    signal_group(&aj, Signal::SIGKILL);
+    wait(&mut aj);
+
+    let state: Value = serde_json::from_slice(&sandbox.aj(&["state", "box"]).stdout).unwrap();
+    assert_eq!(state["status"], "stopped");
+    assert_eq!(state.get("pid"), None);
+    let list = String::from_utf8(sandbox.aj(&["list"]).stdout).unwrap();
+    assert!(
+        list.lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("box  -        stopped "),
+        "{list}"
+    );
+
+    let missing = sandbox.aj(&["state", "other"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no container"));
 }
 
 #[test]

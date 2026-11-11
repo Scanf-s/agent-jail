@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::unistd::Uid;
 use std::path::Path;
@@ -43,6 +43,16 @@ fn main() -> Result<ExitCode> {
             let mapping = prepare_new_container(&state_root)?;
             let config = oci::Bundle::load(&bundle)?.into_config(&mapping)?;
             runtime::Runtime::new(config, mapping, &state_root)?.run()
+        }
+        cli::Command::State { id } => {
+            let record = state::read(&state_root, &id)?;
+            let json = serde_json::to_string_pretty(&record.oci).context("serialize the state")?;
+            println!("{json}");
+            Ok(ExitCode::SUCCESS)
+        }
+        cli::Command::List => {
+            print!("{}", state::table(&state::list(&state_root)?));
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
