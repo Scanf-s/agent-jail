@@ -33,14 +33,15 @@ pub struct Record {
     /// When the runtime created the container, in seconds after the Unix epoch.
     pub created: u64,
     /// Whether the runtime removes the container when its program ends, as `run` does. OCI
-    /// keeps a container until `delete`.
+    /// keeps a container that `create` created until `delete`. Until then, the user does not
+    /// know the container, so it is removed, too.
     pub auto_delete: bool,
 }
 
 impl Record {
     pub const VERSION: u32 = 1;
 
-    /// The record of a container in the cgroup `cgroup` that `run` is creating now.
+    /// The record of a container in the cgroup `cgroup` that the runtime is creating now.
     pub fn creating(
         id: &ContainerId,
         cgroup: PathBuf,

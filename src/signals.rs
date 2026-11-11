@@ -8,7 +8,7 @@ use std::fs;
 use std::os::fd::{AsFd, BorrowedFd};
 
 /// Signals that a terminal, a process manager, or a user sends to end a program.
-const TERMINATION_SIGNALS: [Signal; 4] = [
+pub const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
     Signal::SIGQUIT,

@@ -5,7 +5,7 @@ use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::{self, ChildChannels, StartupChannels};
 use crate::network;
 use crate::proc_stat;
-use crate::signals::{self, Event, RuntimeSignals};
+use crate::signals::{self, Event, RuntimeSignals, TERMINATION_SIGNALS};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
@@ -13,15 +13,36 @@ use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
-use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setgroups, setuid};
+use nix::unistd::{
+    ForkResult, Gid, Pid, Uid, chdir, dup2, fork, setgid, setgroups, setsid, setuid,
+};
 use oci_spec::runtime::ContainerState;
 use startup::Report;
-use std::os::fd::{AsFd, OwnedFd};
+use std::fs::OpenOptions;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
 
 mod startup;
+
+/// What the runtime does with a container that it created.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Run the program at once, wait until it ends, and remove the container, as `run` does.
+    Run,
+    /// Exit when the container is created, and keep it until a later command starts it, as
+    /// OCI `create` does.
+    Create,
+}
+
+/// How the wait of the runtime for the setup process ended.
+enum Outcome {
+    /// `create` created the container.
+    Created,
+    /// The setup process ended with this exit code.
+    Exited(u8),
+}
 
 pub struct Runtime {
     config: ContainerConfig,
@@ -64,16 +85,36 @@ impl Runtime {
         })
     }
 
-    pub fn run(mut self) -> Result<ExitCode> {
+    /// Run the program of the container, wait until it ends, and remove the container.
+    pub fn run(self) -> Result<ExitCode> {
+        self.launch(Mode::Run)
+    }
+
+    /// Create the container and return. Its program waits until `start`.
+    pub fn create(self) -> Result<ExitCode> {
+        self.launch(Mode::Create)
+    }
+
+    fn launch(mut self, mode: Mode) -> Result<ExitCode> {
         let signals = RuntimeSignals::block()?;
         match unsafe { fork() }.context("fork failed")? {
-            ForkResult::Parent { child } => self.run_parent(child, &signals),
-            ForkResult::Child => self.run_setup_process(&signals),
+            ForkResult::Parent { child } => self.run_parent(child, &signals, mode),
+            ForkResult::Child => self.run_setup_process(&signals, mode),
         }
     }
 
-    fn run_parent(&mut self, child: Pid, signals: &RuntimeSignals) -> Result<ExitCode> {
-        let result = self.wait_for_container(child, signals);
+    fn run_parent(&mut self, child: Pid, signals: &RuntimeSignals, mode: Mode) -> Result<ExitCode> {
+        let result = match self.wait_for_container(child, signals, mode) {
+            Ok(Outcome::Created) => {
+                // The setup process now waits for the start, and it removes the run directory
+                // when init ends. The state stays until the container is deleted. The container
+                // cgroup holds init, so dropping it here does not remove it.
+                self.state_dir.keep();
+                return Ok(ExitCode::SUCCESS);
+            }
+            Ok(Outcome::Exited(code)) => Ok(ExitCode::from(code)),
+            Err(error) => Err(error),
+        };
         // If the setup process ended before container init, init still runs, and nothing else
         // would end it.
         let ended = self.cgroup.kill_all();
@@ -100,7 +141,12 @@ impl Runtime {
         result
     }
 
-    fn wait_for_container(&mut self, child: Pid, signals: &RuntimeSignals) -> Result<ExitCode> {
+    fn wait_for_container(
+        &mut self,
+        child: Pid,
+        signals: &RuntimeSignals,
+        mode: Mode,
+    ) -> Result<Outcome> {
         let created = match self.setup_parent(child) {
             Ok(created) => created,
             Err(error) => {
@@ -110,14 +156,30 @@ impl Runtime {
             }
         };
 
-        let status = wait_for_setup_process(child, signals, created, || {
-            // Init has its own cgroup now. In the container cgroup, the setup process would
-            // count against the memory limit of the container, and the OOM killer could end it.
-            if let Err(error) = self.cgroup.move_to_runtime(child) {
-                report!("aj: warning: {error:#}");
+        let forwarded: &[Signal] = match mode {
+            // A terminal sends SIGINT and SIGQUIT to the whole foreground process group, so the
+            // setup process and the container already receive them.
+            Mode::Run => &[Signal::SIGTERM, Signal::SIGHUP],
+            // The setup process has a session of its own.
+            Mode::Create => &TERMINATION_SIGNALS,
+        };
+        let mut created = Some(created);
+        loop {
+            match wait_for_setup_process(child, signals, created.take(), forwarded)? {
+                SetupEvent::Created => {
+                    // Init has its own cgroup now. In the container cgroup, the setup process
+                    // would count against the memory limit of the container, and the OOM killer
+                    // could end it.
+                    if let Err(error) = self.cgroup.move_to_runtime(child) {
+                        report!("aj: warning: {error:#}");
+                    }
+                    if mode == Mode::Create {
+                        return Ok(Outcome::Created);
+                    }
+                }
+                SetupEvent::Ended(status) => return Ok(Outcome::Exited(exit_status(status)?)),
             }
-        })?;
-        Ok(ExitCode::from(exit_status(status)?))
+        }
     }
 
     /// Set up the container with the setup process `child`. Returns the read end of the pipe on
@@ -153,15 +215,21 @@ impl Runtime {
         ipc.take_created_reader()
     }
 
-    fn run_setup_process(&mut self, signals: &RuntimeSignals) -> ! {
-        if let Err(error) = self.setup_process(signals) {
+    fn run_setup_process(&mut self, signals: &RuntimeSignals, mode: Mode) -> ! {
+        if let Err(error) = self.setup_process(signals, mode) {
             report!("aj: setup process failed: {error:#}");
             std::process::exit(127);
         }
         unreachable!("setup process returned without exiting");
     }
 
-    fn setup_process(&mut self, signals: &RuntimeSignals) -> Result<()> {
+    fn setup_process(&mut self, signals: &RuntimeSignals, mode: Mode) -> Result<()> {
+        if mode == Mode::Create {
+            // The container stays after `aj create` returns. In a session of its own, it does
+            // not receive the signals of the caller's terminal, for example Ctrl-C for a later
+            // command. Until then, the runtime passes those signals on.
+            setsid().context("create a session for the container")?;
+        }
         let channels = self
             .channels
             .take()
@@ -182,39 +250,73 @@ impl Runtime {
         ipc.signal_network_namespace_ready()?;
         ipc.wait_for_network()?;
 
-        self.launch_init(signals, ipc)
+        self.launch_init(signals, ipc, mode)
     }
 
-    fn launch_init(&mut self, signals: &RuntimeSignals, mut ipc: ChildChannels) -> Result<()> {
+    fn launch_init(
+        &mut self,
+        signals: &RuntimeSignals,
+        mut ipc: ChildChannels,
+        mode: Mode,
+    ) -> Result<()> {
         let (channel, init_channel) = startup::channel()?;
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
                 drop(init_channel);
-                let code = supervise(child, signals, channel, |startup| match startup {
-                    // A created container must report the PID of init, so the program does
-                    // not start without the record.
-                    Startup::Created => {
-                        self.record_created(child)?;
-                        if let Err(error) = ipc.signal_created() {
-                            report!("aj: warning: {error:#}");
+                // Whether `aj create` reported the container as created.
+                let mut reported = false;
+                let start_at_once = mode == Mode::Run;
+                let code = supervise(
+                    child,
+                    signals,
+                    channel,
+                    start_at_once,
+                    |startup| match startup {
+                        // A created container must report the PID of init, so the program does
+                        // not start without the record.
+                        Startup::Created => {
+                            self.record_created(child, mode)?;
+                            match mode {
+                                Mode::Run => {
+                                    if let Err(error) = ipc.signal_created() {
+                                        report!("aj: warning: {error:#}");
+                                    }
+                                }
+                                // Without the report, `aj create` fails, so the container must
+                                // not stay.
+                                Mode::Create => {
+                                    ipc.signal_created()
+                                        .context("report the container to aj create")?;
+                                    reported = true;
+                                    detach()?;
+                                }
+                            }
+                            Ok(())
                         }
-                        Ok(())
-                    }
-                    Startup::Running => {
-                        if let Err(error) = self.record_running() {
-                            report!("aj: warning: {error:#}");
+                        Startup::Running => {
+                            if let Err(error) = self.record_running() {
+                                report!("aj: warning: {error:#}");
+                            }
+                            Ok(())
                         }
-                        Ok(())
-                    }
-                    Startup::Failed(message) => {
-                        report!("aj: container init failed: {message}");
-                        Ok(())
-                    }
-                });
+                        Startup::Failed(message) => {
+                            report!("aj: container init failed: {message}");
+                            Ok(())
+                        }
+                    },
+                );
                 self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
                 // The overlay is already gone, because init's mount namespace ended with it.
                 if let Err(error) = self.run_dir.remove() {
+                    report!("aj: warning: {error:#}");
+                }
+                // A failed `aj create` must leave no container, also when it ended before it
+                // could clean up.
+                if mode == Mode::Create
+                    && !reported
+                    && let Err(error) = self.state_dir.remove()
+                {
                     report!("aj: warning: {error:#}");
                 }
                 std::process::exit(i32::from(code?));
@@ -236,7 +338,7 @@ impl Runtime {
     }
 
     /// Record that container init is ready to execute the program.
-    fn record_created(&mut self, init: Pid) -> Result<()> {
+    fn record_created(&mut self, init: Pid, mode: Mode) -> Result<()> {
         let start_time = proc_stat::start_time(init)?;
         self.state_dir
             .update(|record| {
@@ -245,6 +347,8 @@ impl Runtime {
                     .set_status(ContainerState::Created)
                     .set_pid(Some(init.as_raw()));
                 record.init_start_time = Some(start_time);
+                // From now on, the user knows the container, so it stays until deleted.
+                record.auto_delete = mode == Mode::Run;
             })
             .context("record that the container is created")
     }
@@ -312,6 +416,23 @@ impl Runtime {
     }
 }
 
+/// Let the setup process outlive `aj create`, which returns after this.
+///
+/// The caller may close the other ends of the standard streams, and a working directory keeps
+/// its file system busy. Init keeps its own copies of the streams, as OCI requires.
+fn detach() -> Result<()> {
+    chdir("/").context("chdir to /")?;
+    let null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null")?;
+    for stream in 0..=2 {
+        dup2(null.as_raw_fd(), stream).context("replace a standard stream")?;
+    }
+    Ok(())
+}
+
 /// Make the kernel kill this process, container init, when the setup process ends.
 ///
 /// The setup process waits for init and cleans up after it, so the container must not run
@@ -324,21 +445,25 @@ fn end_with_monitor() -> Result<()> {
     set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")
 }
 
-/// Wait until the setup process ends.
+/// What the runtime saw of the setup process.
+enum SetupEvent {
+    /// The setup process reported that the container is created.
+    Created,
+    /// The setup process ended with this status.
+    Ended(WaitStatus),
+}
+
+/// Wait until the setup process reports on `created` that the container is created, or until
+/// it ends. Without `created`, wait until it ends.
 ///
-/// `created` is the read end of the pipe on which the setup process reports that the container
-/// is created. Then this calls `on_created`.
-///
-/// SIGTERM and SIGHUP usually reach only the runtime, for example from `kill` or a process
-/// manager, so they go to the setup process. A terminal sends SIGINT and SIGQUIT to the whole
-/// foreground process group, so the setup process and the container already receive them.
+/// The signals in `forwarded` usually reach only the runtime, for example from `kill` or a
+/// process manager, so they go to the setup process.
 fn wait_for_setup_process(
     child: Pid,
     signals: &RuntimeSignals,
-    created: OwnedFd,
-    mut on_created: impl FnMut(),
-) -> Result<WaitStatus> {
-    let mut created = Some(created);
+    mut created: Option<OwnedFd>,
+    forwarded: &[Signal],
+) -> Result<SetupEvent> {
     loop {
         let event = match &created {
             Some(pipe) => signals.wait_or_readable(pipe.as_fd()),
@@ -351,24 +476,25 @@ fn wait_for_setup_process(
                 if let Some(pipe) = created.take()
                     && ipc::read_ready(&pipe, "created")?
                 {
-                    on_created();
+                    return Ok(SetupEvent::Created);
                 }
                 continue;
             }
             // Returning early would remove the run directory while the container still uses it.
             Err(error) => {
                 report!("aj: warning: {error:#}");
-                return waitpid(child, None).context("waitpid failed");
+                let status = waitpid(child, None).context("waitpid failed")?;
+                return Ok(SetupEvent::Ended(status));
             }
         };
         match signal {
             Signal::SIGCHLD => {
                 match waitpid(child, Some(WaitPidFlag::WNOHANG)).context("waitpid failed")? {
                     WaitStatus::StillAlive => {}
-                    status => return Ok(status),
+                    status => return Ok(SetupEvent::Ended(status)),
                 }
             }
-            signal @ (Signal::SIGTERM | Signal::SIGHUP) => {
+            signal if forwarded.contains(&signal) => {
                 let _ = kill(child, signal);
             }
             _ => {}
@@ -389,17 +515,18 @@ enum Startup {
 /// Wait until container init ends, and return the exit code for the runtime.
 ///
 /// `channel` is the end of the startup channel that the setup process keeps. This passes what
-/// init does before its program runs to `on_startup`, and starts the program after
-/// `on_startup` accepted `Startup::Created`.
+/// init does before its program runs to `on_startup`. If `start_at_once`, this starts the
+/// program after `on_startup` accepted `Startup::Created`.
 ///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
 fn supervise(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
+    start_at_once: bool,
     on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
-    let result = wait_for_init(init, signals, channel, on_startup);
+    let result = wait_for_init(init, signals, channel, start_at_once, on_startup);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -411,6 +538,7 @@ fn wait_for_init(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
+    start_at_once: bool,
     mut on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
     let mut channel = Some(channel);
@@ -434,8 +562,10 @@ fn wait_for_init(
                 match startup::read_report(open)? {
                     Report::Ready => {
                         on_startup(Startup::Created)?;
-                        startup::start(open)?;
-                        started = true;
+                        if start_at_once {
+                            startup::start(open)?;
+                            started = true;
+                        }
                     }
                     report => {
                         channel = None;

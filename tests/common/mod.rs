@@ -8,11 +8,12 @@
 
 use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::Pid;
-use serde_json::Value;
-use std::fs;
+use serde_json::{Value, json};
+use std::fs::{self, File};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -88,6 +89,96 @@ impl Sandbox {
             .unwrap()
     }
 
+    /// Write an OCI bundle whose program is `args`, running in `cwd`, and return its directory.
+    pub fn bundle(&self, args: &[&str], cwd: &str) -> PathBuf {
+        let dir = self.root.join("bundle");
+        fs::create_dir_all(&dir).unwrap();
+        let config = json!({
+            "ociVersion": "1.3.0",
+            "root": { "path": rootfs() },
+            "process": {
+                "user": { "uid": 0, "gid": 0 },
+                "args": args,
+                "env": ["PATH=/bin:/usr/bin:/sbin:/usr/sbin"],
+                "cwd": cwd,
+            },
+            "mounts": [{
+                "destination": "/proc",
+                "type": "proc",
+                "source": "proc",
+                "options": ["nosuid", "nodev", "noexec"],
+            }],
+            "linux": {
+                "namespaces": [
+                    { "type": "user" },
+                    { "type": "pid" },
+                    { "type": "network" },
+                    { "type": "mount" },
+                    { "type": "cgroup" },
+                ],
+            },
+        });
+        fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        dir
+    }
+
+    /// Run `aj create` with `bundle` and `id`, and wait for it.
+    ///
+    /// The container program keeps the standard streams of `aj create`. A pipe would reach EOF
+    /// only when the program ends, so the streams go to files in the sandbox.
+    pub fn create(&self, bundle: &Path, id: &str) -> Created {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let name = format!("create-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let stdout = self.root.join(format!("{name}.stdout"));
+        let stderr = self.root.join(format!("{name}.stderr"));
+        let mut aj = Command::new(env!("CARGO_BIN_EXE_aj"))
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .arg("--root")
+            .arg(self.root.join("state"))
+            .arg("create")
+            .arg("--bundle")
+            .arg(bundle)
+            .arg(id)
+            .stdin(Stdio::null())
+            .stdout(File::create(&stdout).unwrap())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let status = wait(&mut aj);
+        Created {
+            status,
+            stdout,
+            stderr: fs::read_to_string(stderr).unwrap(),
+        }
+    }
+
+    /// The OCI state that `aj state` prints for container `id`.
+    pub fn state(&self, id: &str) -> Value {
+        let output = self.aj(&["state", id]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    }
+
+    /// Wait until `aj state` shows `status` for container `id`, and return that state.
+    pub fn wait_for_status(&self, id: &str, status: &str) -> Value {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let state = self.state(id);
+            if state["status"] == status {
+                return state;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "container {id} never showed {status}: {state}"
+            );
+            sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn wait_until_ready(&self) {
         let deadline = Instant::now() + TIMEOUT;
         while !self.root.join("out/ready").exists() {
@@ -133,6 +224,14 @@ impl Sandbox {
     }
 }
 
+/// What `Sandbox::create` saw of `aj create`.
+pub struct Created {
+    pub status: ExitStatus,
+    /// The file that receives the standard output of the container program.
+    pub stdout: PathBuf,
+    pub stderr: String,
+}
+
 pub fn rootfs() -> PathBuf {
     std::env::var_os("AJ_TEST_ROOTFS").map_or_else(
         || {
@@ -165,6 +264,17 @@ pub fn wait(child: &mut Child) -> ExitStatus {
 
 pub fn signal_group(child: &Child, signal: Signal) {
     kill(Pid::from_raw(-(child.id() as i32)), signal).unwrap();
+}
+
+/// The parent process of `pid`.
+pub fn parent_of(pid: Pid) -> Pid {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    // The fields after the command name, which is in parentheses, are the state and the parent.
+    let parent = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    Pid::from_raw(parent.parse().unwrap())
 }
 
 /// The only child process of `pid`.

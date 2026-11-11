@@ -31,6 +31,15 @@ pub enum Command {
         /// Path to the bundle directory that contains config.json.
         bundle: PathBuf,
     },
+    /// Create a container from an OCI bundle. Its program waits until `start`.
+    Create {
+        /// Path to the bundle directory that contains config.json.
+        #[arg(long, value_name = "DIR", default_value = ".")]
+        bundle: PathBuf,
+        /// Container ID.
+        #[arg(value_parser = ContainerId::parse)]
+        id: ContainerId,
+    },
     /// Print the OCI state of a container as JSON.
     State {
         /// Container ID.
@@ -134,6 +143,25 @@ mod tests {
             error.to_string().contains("invalid container ID"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn parses_create() {
+        let cli = Cli::try_parse_from(["aj", "create", "--bundle", "./box", "box1"]).unwrap();
+        let Command::Create { bundle, id } = cli.command else {
+            panic!("expected the create command");
+        };
+        assert_eq!(bundle, PathBuf::from("./box"));
+        assert_eq!(id.as_str(), "box1");
+
+        // As in the OCI runtime command line, the bundle is the current directory by default.
+        let cli = Cli::try_parse_from(["aj", "create", "box1"]).unwrap();
+        let Command::Create { bundle, .. } = cli.command else {
+            panic!("expected the create command");
+        };
+        assert_eq!(bundle, PathBuf::from("."));
+        assert!(Cli::try_parse_from(["aj", "create"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "create", "-box"]).is_err());
     }
 
     #[test]
