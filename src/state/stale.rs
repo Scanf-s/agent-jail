@@ -1,7 +1,8 @@
-use super::Record;
+use super::{Record, STATE_FILE};
 use crate::flock::{LockKind, try_lock};
-use anyhow::{Context, Result};
-use std::fs::{self, File};
+use anyhow::{Context, Result, bail};
+use serde_json::Value;
+use std::fs::{self, DirEntry, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -11,69 +12,115 @@ use std::path::{Path, PathBuf};
 /// A killed run cannot remove its own state directory. When the user lingers, systemd clears
 /// `$XDG_RUNTIME_DIR` only at reboot, so these directories would stay until then.
 pub fn remove_stale(root: &Path) -> Result<()> {
-    let mut result = Ok(());
-    // The locks stay held until the removal ends, so another runtime skips these directories.
-    for (path, _lock) in find_stale(root)? {
-        match fs::remove_dir_all(&path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                result = Err(error).with_context(|| format!("remove state directory {path:?}"));
-            }
+    let Some(mut scan) = find_stale(root)? else {
+        return Ok(());
+    };
+    for (path, _lock) in &scan.stale {
+        match fs::remove_dir_all(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => scan
+                .errors
+                .push(anyhow::Error::new(error).context(format!("remove {path:?}"))),
             _ => {}
         }
     }
-    result
+    if scan.errors.is_empty() {
+        return Ok(());
+    }
+    let messages: Vec<String> = scan
+        .errors
+        .iter()
+        .map(|error| format!("{error:#}"))
+        .collect();
+    bail!("{}", messages.join("; "))
 }
 
-/// Lock and return the state directories to remove.
-fn find_stale(root: &Path) -> Result<Vec<(PathBuf, File)>> {
+/// The state directories that a cleanup found, with the locks that it holds until it ends.
+struct Scan {
+    // A runtime creates a state directory only while it holds a shared lock on the root. While
+    // this exclusive lock is held, no runtime can create a directory at the path of one that
+    // this cleanup removes.
+    _root_lock: File,
+    /// The stale directories, each with its exclusive lock.
+    stale: Vec<(PathBuf, File)>,
+    /// Errors for single directories. Those directories stay, and the cleanup goes on.
+    errors: Vec<anyhow::Error>,
+}
+
+/// Lock and find the state directories to remove. Returns `None` if there is no root, or if a
+/// runtime is creating a state directory now.
+fn find_stale(root: &Path) -> Result<Option<Scan>> {
     let root_file = match File::open(root) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         result => result.with_context(|| format!("open {root:?}"))?,
     };
-    // A runtime that is creating its state directory holds a shared lock. Waiting for it could
-    // block for as long as that runtime is stopped, so this run skips the cleanup instead.
-    let Some(_no_creation) =
+    // Waiting for a runtime that creates its state directory could block for as long as that
+    // runtime is stopped, so this run skips the cleanup instead.
+    let Some(root_lock) =
         try_lock(root_file, LockKind::Exclusive).with_context(|| format!("lock {root:?}"))?
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
 
-    let mut stale = Vec::new();
+    let mut scan = Scan {
+        _root_lock: root_lock,
+        stale: Vec::new(),
+        errors: Vec::new(),
+    };
     for entry in fs::read_dir(root).with_context(|| format!("read {root:?}"))? {
-        let entry = entry.with_context(|| format!("read {root:?}"))?;
-        // file_type does not follow symbolic links, so only real directories are removed.
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let path = entry.path();
-        let dir = match File::open(&path) {
-            // The run removed its own directory after read_dir listed it.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            result => result.with_context(|| format!("open {path:?}"))?,
-        };
-        // A held lock shows that a runtime process of the container is alive.
-        let Some(lock) =
-            try_lock(dir, LockKind::Exclusive).with_context(|| format!("lock {path:?}"))?
-        else {
-            continue;
-        };
-        if is_stale(&path) {
-            stale.push((path, lock));
+        match lock_if_stale(entry) {
+            Ok(Some(found)) => scan.stale.push(found),
+            Ok(None) => {}
+            Err(error) => scan.errors.push(error),
         }
     }
-    Ok(stale)
+    Ok(Some(scan))
+}
+
+/// Lock and return the directory of `entry` if it is a stale state directory.
+fn lock_if_stale(entry: io::Result<DirEntry>) -> Result<Option<(PathBuf, File)>> {
+    let entry = entry.context("read the state root")?;
+    // file_type does not follow symbolic links, so only real directories are removed.
+    if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        return Ok(None);
+    }
+    let path = entry.path();
+    let dir = match File::open(&path) {
+        // The run removed its own directory after read_dir listed it.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        result => result.with_context(|| format!("open {path:?}"))?,
+    };
+    // A held lock shows that a runtime process of the container is alive.
+    let Some(lock) =
+        try_lock(dir, LockKind::Exclusive).with_context(|| format!("lock {path:?}"))?
+    else {
+        return Ok(None);
+    };
+    Ok(is_stale(&path)?.then_some((path, lock)))
 }
 
 /// Whether the state directory `dir`, which no runtime process holds, can go.
-fn is_stale(dir: &Path) -> bool {
-    // No runtime process will write a missing or broken state file again. The directory would
-    // only keep its ID from being used.
-    let Ok(record) = Record::load(dir) else {
-        return true;
+fn is_stale(dir: &Path) -> Result<bool> {
+    let path = dir.join(STATE_FILE);
+    let json = match fs::read(&path) {
+        // A run that was killed while it created the directory left no state file. No runtime
+        // process will write one, and the directory would only keep its name in use.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        result => result.with_context(|| format!("read {path:?}"))?,
+    };
+    // The runtime replaces the file at once, so a broken file is not a write in progress.
+    let Ok(value) = serde_json::from_slice::<Value>(&json) else {
+        return Ok(true);
+    };
+    // A later version of the runtime may keep containers that this version would remove.
+    let version = value.get("stateVersion").and_then(Value::as_u64);
+    if version.is_some_and(|version| version > u64::from(Record::VERSION)) {
+        return Ok(false);
+    }
+    let Ok(record) = serde_json::from_value::<Record>(value) else {
+        return Ok(true);
     };
     // OCI keeps a container that `create` made until `delete`, even after its program ended.
-    // If the check of init fails, the directory stays, because init may still run.
-    record.auto_delete && record.init_runs().is_ok_and(|runs| !runs)
+    Ok(record.auto_delete && !record.init_runs()?)
 }
 
 #[cfg(test)]
@@ -151,15 +198,53 @@ mod tests {
             record.auto_delete = false;
         });
         fs::create_dir(root.0.join("no-state")).unwrap();
+        // A run killed while it created its state directory leaves it under a temporary name.
+        fs::create_dir(root.0.join(".creating-0123456789abcdef")).unwrap();
         root.leave("broken", |_| {});
         fs::write(root.0.join("broken").join(STATE_FILE), "{").unwrap();
+        root.leave("later-version", |_| {});
+        let later = root.0.join("later-version").join(STATE_FILE);
+        let mut json: Value = serde_json::from_slice(&fs::read(&later).unwrap()).unwrap();
+        json["stateVersion"] = (Record::VERSION + 1).into();
+        fs::write(&later, serde_json::to_vec(&json).unwrap()).unwrap();
         fs::write(root.0.join("note"), "").unwrap();
 
-        let stale = find_stale(&root.0).unwrap();
+        let scan = find_stale(&root.0).unwrap().unwrap();
 
-        assert_eq!(names(&stale), ["broken", "creating", "killed", "no-state"]);
-        // While the first cleanup holds its locks, a second one finds nothing.
-        assert!(find_stale(&root.0).unwrap().is_empty());
+        assert_eq!(
+            names(&scan.stale),
+            [
+                ".creating-0123456789abcdef",
+                "broken",
+                "creating",
+                "killed",
+                "no-state"
+            ]
+        );
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        // While the first cleanup holds the root lock, a second one skips the cleanup.
+        assert!(find_stale(&root.0).unwrap().is_none());
+    }
+
+    #[test]
+    fn goes_on_after_a_directory_that_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+        // Root bypasses file permissions, so this case cannot be reproduced.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let root = TempRoot::new();
+        root.leave("killed", |record| running(record, 1));
+        let locked_out = root.0.join("locked-out");
+        fs::create_dir(&locked_out).unwrap();
+        fs::set_permissions(&locked_out, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let error = remove_stale(&root.0).unwrap_err();
+
+        fs::set_permissions(&locked_out, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(error.to_string().contains("locked-out"), "{error:#}");
+        assert!(!root.0.join("killed").exists());
+        assert!(locked_out.exists());
     }
 
     #[test]
@@ -180,12 +265,12 @@ mod tests {
         root.leave("creating", |_| {});
         let _creating = lock(File::open(&root.0).unwrap(), LockKind::Shared).unwrap();
 
-        assert!(find_stale(&root.0).unwrap().is_empty());
+        assert!(find_stale(&root.0).unwrap().is_none());
     }
 
     #[test]
     fn finds_nothing_without_a_root() {
         let root = TempRoot::new();
-        assert!(find_stale(&root.0.join("missing")).unwrap().is_empty());
+        assert!(find_stale(&root.0.join("missing")).unwrap().is_none());
     }
 }

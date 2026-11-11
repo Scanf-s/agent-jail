@@ -77,14 +77,16 @@ impl RunDir {
 /// Remove the run directories that no live run holds. A run that is killed, for example with
 /// SIGKILL, cannot remove its own directory.
 pub fn remove_stale(mapping: &Mapping) -> Result<()> {
-    let stale = find_stale(&runs_dir()?)?;
-    if stale.is_empty() {
+    let Some(stale) = find_stale(&runs_dir()?)? else {
+        return Ok(());
+    };
+    if stale.dirs.is_empty() {
         return Ok(());
     }
     run_in_user_namespace(mapping, || {
         let mut result = Ok(());
         // The locks stay held until the removal ends, so another runtime skips these directories.
-        for (path, _lock) in &stale {
+        for (path, _lock) in &stale.dirs {
             if let Err(error) = remove_dir(path) {
                 result = Err(error);
             }
@@ -93,18 +95,29 @@ pub fn remove_stale(mapping: &Mapping) -> Result<()> {
     })
 }
 
-/// Lock and return the run directories whose lock is free.
-fn find_stale(runs: &Path) -> Result<Vec<(PathBuf, File)>> {
+/// The run directories that a cleanup found, with the locks that it holds until it ends.
+struct StaleRuns {
+    // A runtime creates a run directory only while it holds a shared lock on `runs`. While this
+    // exclusive lock is held, no runtime can create a directory at the path of one that the
+    // cleanup removes.
+    _runs_lock: File,
+    /// The run directories whose lock was free, each with its exclusive lock.
+    dirs: Vec<(PathBuf, File)>,
+}
+
+/// Lock and find the run directories whose lock is free. Returns `None` if there is no `runs`,
+/// or if a runtime is creating a run directory now.
+fn find_stale(runs: &Path) -> Result<Option<StaleRuns>> {
     let runs_file = match File::open(runs) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         result => result.with_context(|| format!("open {runs:?}"))?,
     };
-    // A runtime that is creating its run directory holds a shared lock. Waiting for it could
-    // block for as long as that runtime is stopped, so this run skips the cleanup instead.
-    let Some(_no_creation) =
+    // Waiting for a runtime that creates its run directory could block for as long as that
+    // runtime is stopped, so this run skips the cleanup instead.
+    let Some(runs_lock) =
         try_lock(runs_file, LockKind::Exclusive).with_context(|| format!("lock {runs:?}"))?
     else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
 
     let mut stale = Vec::new();
@@ -126,7 +139,10 @@ fn find_stale(runs: &Path) -> Result<Vec<(PathBuf, File)>> {
             stale.push((path, dir));
         }
     }
-    Ok(stale)
+    Ok(Some(StaleRuns {
+        _runs_lock: runs_lock,
+        dirs: stale,
+    }))
 }
 
 fn runs_dir() -> Result<PathBuf> {
@@ -198,15 +214,16 @@ mod tests {
         fs::create_dir(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
         fs::write(runs.0.join("note"), "").unwrap();
 
-        let stale = find_stale(&runs.0).unwrap();
-        assert_eq!(TempRuns::names(&stale), ["bbbbbbbbbbbbbbbb"]);
-        // While the first cleanup holds its locks, a second one finds nothing.
-        assert!(find_stale(&runs.0).unwrap().is_empty());
+        let stale = find_stale(&runs.0).unwrap().unwrap();
+        assert_eq!(TempRuns::names(&stale.dirs), ["bbbbbbbbbbbbbbbb"]);
+        // While the first cleanup holds the lock of `runs`, a second one skips the cleanup.
+        assert!(find_stale(&runs.0).unwrap().is_none());
         drop(stale);
 
         drop(live);
+        let stale = find_stale(&runs.0).unwrap().unwrap();
         assert_eq!(
-            TempRuns::names(&find_stale(&runs.0).unwrap()),
+            TempRuns::names(&stale.dirs),
             ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]
         );
     }
@@ -217,12 +234,12 @@ mod tests {
         fs::create_dir_all(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
         let _creating = lock(File::open(&runs.0).unwrap(), LockKind::Shared).unwrap();
 
-        assert!(find_stale(&runs.0).unwrap().is_empty());
+        assert!(find_stale(&runs.0).unwrap().is_none());
     }
 
     #[test]
     fn finds_nothing_without_a_runs_directory() {
         let runs = TempRuns::new();
-        assert!(find_stale(&runs.0).unwrap().is_empty());
+        assert!(find_stale(&runs.0).unwrap().is_none());
     }
 }
