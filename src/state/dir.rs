@@ -2,6 +2,7 @@ use super::{Record, STATE_FILE};
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
 use anyhow::{Context, Result, anyhow};
+use nix::unistd::Pid;
 use std::fs::{self, DirBuilder, File};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -11,13 +12,16 @@ const TEMPORARY_FILE: &str = "state.json.tmp";
 
 /// The directory `<root>/<id>` that holds the state file of one container.
 ///
-/// Dropping it removes the directory, so a run that fails while it starts leaves nothing
-/// behind. Only the runtime process that created it drops it, because the setup process and
-/// container init end with exit or exec.
+/// Dropping it in the process that created it removes the directory, so a run that fails while
+/// it starts leaves nothing behind. `keep` stops that.
 pub struct StateDir {
     path: PathBuf,
     /// What the state file holds now.
     record: Record,
+    /// The process that created the directory. The setup process and container init have a
+    /// copy after fork, and a panic there would drop it while the container still runs.
+    owner: Pid,
+    keep: bool,
     // An exclusive flock shows that a runtime process of the container is alive, as for the
     // run directory. The forked processes share this open file, and the kernel releases the
     // lock when the last of them ends, even when they are killed.
@@ -52,10 +56,17 @@ impl StateDir {
         let dir = Self {
             path,
             record,
+            owner: Pid::this(),
+            keep: false,
             _lock: lock,
         };
         dir.write()?;
         Ok(dir)
+    }
+
+    /// Leave the directory in place when this is dropped.
+    pub fn keep(&mut self) {
+        self.keep = true;
     }
 
     /// Fail if container `id` has a state directory under `root`.
@@ -103,7 +114,9 @@ impl StateDir {
 
 impl Drop for StateDir {
     fn drop(&mut self) {
-        let _ = self.remove();
+        if !self.keep && Pid::this() == self.owner {
+            let _ = self.remove();
+        }
     }
 }
 
@@ -202,6 +215,23 @@ mod tests {
 
         drop(dir);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn stays_when_kept_or_dropped_in_another_process() {
+        let root = TempRoot::new();
+        let kept = ContainerId::parse("kept").unwrap();
+        let mut dir = StateDir::create(&root.0, &kept, record(&kept)).unwrap();
+        dir.keep();
+        drop(dir);
+        assert!(root.0.join("kept").exists());
+
+        let copied = ContainerId::parse("copied").unwrap();
+        let mut dir = StateDir::create(&root.0, &copied, record(&copied)).unwrap();
+        // A forked process has another PID than the process that created the directory.
+        dir.owner = Pid::from_raw(dir.owner.as_raw() + 1);
+        drop(dir);
+        assert!(root.0.join("copied").exists());
     }
 
     #[test]

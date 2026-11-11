@@ -69,16 +69,26 @@ impl Runtime {
         let result = self.wait_for_container(child, signals);
         // If the setup process ended before container init, init still runs, and nothing else
         // would end it.
-        if let Err(error) = self.cgroup.kill_all() {
-            eprintln!("aj: warning: end the processes left in the container: {error:#}");
-        }
+        let ended = self.cgroup.kill_all();
         // The setup process removes the run directory. This covers a run that fails before that.
         if let Err(error) = self.run_dir.remove() {
             eprintln!("aj: warning: {error:#}");
         }
-        // No process of the container is left, so its state can go.
-        if let Err(error) = self.state_dir.remove() {
-            eprintln!("aj: warning: {error:#}");
+        match ended {
+            Ok(()) => {
+                if let Err(error) = self.state_dir.remove() {
+                    eprintln!("aj: warning: {error:#}");
+                }
+            }
+            // The state keeps the container visible in `aj list` and its ID in use while its
+            // processes may still run.
+            Err(error) => {
+                eprintln!(
+                    "aj: warning: end the processes left in the container, so its state stays: \
+                     {error:#}"
+                );
+                self.state_dir.keep();
+            }
         }
         result
     }
