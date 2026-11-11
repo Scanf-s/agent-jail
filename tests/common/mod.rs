@@ -10,6 +10,7 @@ use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
 use std::fs::{self, File};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
@@ -243,8 +244,28 @@ pub fn rootfs() -> PathBuf {
 }
 
 impl Drop for Sandbox {
+    /// Remove the sandbox. A killed run leaves the overlay work directory without permissions,
+    /// and the setup process of a container that a test ended may still remove its run
+    /// directory, so this retries for a short time.
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::remove_dir_all(&self.root).is_err()
+            && self.root.exists()
+            && Instant::now() < deadline
+        {
+            allow_removal(&self.root);
+            sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Give the owner full permissions on `dir` and on every directory below it.
+fn allow_removal(dir: &Path) {
+    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            allow_removal(&entry.path());
+        }
     }
 }
 
