@@ -14,6 +14,7 @@ mod network;
 mod oci;
 mod paths;
 mod runtime;
+mod signals;
 mod user;
 
 #[cfg(target_os = "linux")]
