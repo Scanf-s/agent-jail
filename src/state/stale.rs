@@ -1,4 +1,5 @@
 use super::{Record, STATE_FILE};
+use crate::cgroups;
 use crate::flock::{LockKind, try_lock};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -120,7 +121,9 @@ fn is_stale(dir: &Path) -> Result<bool> {
         return Ok(true);
     };
     // OCI keeps a container that `create` made until `delete`, even after its program ended.
-    Ok(record.auto_delete && !record.init_runs()?)
+    // A process that the runtime could not end, for example one in uninterruptible sleep, keeps
+    // the cgroup populated. Until it ends, the state shows the container and keeps its ID in use.
+    Ok(record.auto_delete && !record.init_runs()? && !cgroups::holds_processes(&record.cgroup)?)
 }
 
 #[cfg(test)]
@@ -146,7 +149,12 @@ mod tests {
         /// Write a state directory as a killed runtime would leave it.
         fn leave(&self, name: &str, change: impl FnOnce(&mut Record)) {
             let id = ContainerId::parse(name).unwrap();
-            let mut record = Record::creating(&id, PathBuf::from("/bundle"), None);
+            let mut record = Record::creating(
+                &id,
+                PathBuf::from("/no/cgroup"),
+                PathBuf::from("/bundle"),
+                None,
+            );
             change(&mut record);
             let dir = self.0.join(name);
             fs::create_dir(&dir).unwrap();
@@ -186,7 +194,12 @@ mod tests {
         let _live = StateDir::create(
             &root.0,
             &live,
-            Record::creating(&live, PathBuf::from("/bundle"), None),
+            Record::creating(
+                &live,
+                PathBuf::from("/no/cgroup"),
+                PathBuf::from("/bundle"),
+                None,
+            ),
         )
         .unwrap();
         // An init with another start time is a later process that reuses the PID.
@@ -257,6 +270,24 @@ mod tests {
 
         assert!(!root.0.join("killed").exists());
         assert!(root.0.join("init-runs").exists());
+    }
+
+    #[test]
+    fn keeps_a_container_whose_cgroup_holds_processes() {
+        let root = TempRoot::new();
+        // The runtime could not end the processes before init was recorded.
+        let cgroups = TempRoot::new();
+        let cgroup = cgroups.0.join("jail_unended");
+        fs::create_dir(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        root.leave("unended", |record| record.cgroup = cgroup.clone());
+
+        remove_stale(&root.0).unwrap();
+        assert!(root.0.join("unended").exists());
+
+        fs::write(cgroup.join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        remove_stale(&root.0).unwrap();
+        assert!(!root.0.join("unended").exists());
     }
 
     #[test]

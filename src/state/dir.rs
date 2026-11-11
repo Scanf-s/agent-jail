@@ -167,7 +167,12 @@ mod tests {
     }
 
     fn record(id: &ContainerId) -> Record {
-        Record::creating(id, PathBuf::from("/bundle"), None)
+        Record::creating(
+            id,
+            PathBuf::from("/no/cgroup"),
+            PathBuf::from("/bundle"),
+            None,
+        )
     }
 
     fn read(path: &Path) -> Record {

@@ -27,6 +27,9 @@ pub struct Record {
     /// The exit code of the container program, after it ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u8>,
+    /// The cgroup of the container. A process that the runtime could not end keeps it
+    /// populated after init ended.
+    pub cgroup: PathBuf,
     /// When the runtime created the container, in seconds after the Unix epoch.
     pub created: u64,
     /// Whether the runtime removes the container when its program ends, as `run` does. OCI
@@ -37,9 +40,10 @@ pub struct Record {
 impl Record {
     pub const VERSION: u32 = 1;
 
-    /// The record of a container that `run` is creating now.
+    /// The record of a container in the cgroup `cgroup` that `run` is creating now.
     pub fn creating(
         id: &ContainerId,
+        cgroup: PathBuf,
         bundle: PathBuf,
         annotations: Option<HashMap<String, String>>,
     ) -> Self {
@@ -57,6 +61,7 @@ impl Record {
             state_version: Self::VERSION,
             init_start_time: None,
             exit_code: None,
+            cgroup,
             created,
             auto_delete: true,
         }
@@ -88,6 +93,7 @@ mod tests {
         let annotations = HashMap::from([("purpose".to_owned(), "test".to_owned())]);
         Record::creating(
             &ContainerId::parse("box1").unwrap(),
+            PathBuf::from("/sys/fs/cgroup/jail_box1"),
             PathBuf::from("/home/user/box"),
             Some(annotations),
         )
@@ -109,6 +115,7 @@ mod tests {
                 "bundle": "/home/user/box",
                 "annotations": { "purpose": "test" },
                 "stateVersion": 1,
+                "cgroup": "/sys/fs/cgroup/jail_box1",
                 "created": 1_762_838_400,
                 "autoDelete": true,
             })

@@ -184,7 +184,12 @@ mod tests {
     }
 
     fn record(name: &str, created: u64) -> Record {
-        let mut record = Record::creating(&id(name), PathBuf::from("/bundle"), None);
+        let mut record = Record::creating(
+            &id(name),
+            PathBuf::from("/no/cgroup"),
+            PathBuf::from("/bundle"),
+            None,
+        );
         record.created = created;
         record
     }

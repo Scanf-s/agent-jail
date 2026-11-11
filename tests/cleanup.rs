@@ -210,6 +210,8 @@ fn records_the_state_while_the_container_runs() {
     assert_eq!(states[0]["status"], "running");
     assert_eq!(states[0]["pid"], init.as_raw());
     assert!(states[0]["initStartTime"].as_u64().unwrap() > 0);
+    let cgroup = PathBuf::from(states[0]["cgroup"].as_str().unwrap());
+    assert!(cgroup.join("cgroup.events").is_file(), "{cgroup:?}");
     assert_eq!(states[0]["bundle"], rootfs().to_str().unwrap());
     assert_eq!(states[0]["autoDelete"], true);
 

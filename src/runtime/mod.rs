@@ -38,11 +38,16 @@ impl Runtime {
         }
         // This may replace the process, so it runs before the runtime opens any resource.
         let (delegated, id) = cgroups::enter_delegated_cgroup(config.id.as_ref())?;
-        // If a later step fails, dropping the state directory removes it again.
-        let record = Record::creating(&id, config.bundle.clone(), config.annotations.clone());
-        let state_dir = StateDir::create(state_root, &id, record)?;
+        // If a later step fails, dropping the cgroup and the state directory removes them again.
         let cgroup = Cgroup::new(&delegated, &id)?;
         cgroup.configure(&config.resources)?;
+        let record = Record::creating(
+            &id,
+            cgroup.path().to_owned(),
+            config.bundle.clone(),
+            config.annotations.clone(),
+        );
+        let state_dir = StateDir::create(state_root, &id, record)?;
         let run_dir = RunDir::create(&id)?;
 
         let channels = StartupChannels::new()?;

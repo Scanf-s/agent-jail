@@ -68,6 +68,15 @@ pub fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
     check_controllers(&available).with_context(|| format!("cgroup {dir:?}"))
 }
 
+/// Whether the cgroup `path` or one of its descendants holds a process. A cgroup that does not
+/// exist holds none.
+pub fn holds_processes(path: &Path) -> Result<bool> {
+    match fs::read_to_string(path.join("cgroup.events")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        result => is_populated(&result.with_context(|| format!("read {path:?}/cgroup.events"))?),
+    }
+}
+
 /// Whether `cgroup.events` reports a process in the cgroup or in one of its descendants.
 fn is_populated(events: &str) -> Result<bool> {
     let value = events
@@ -176,6 +185,10 @@ impl Cgroup {
         Ok(())
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn add_pid(&self, pid: nix::unistd::Pid) -> Result<()> {
         fs::write(self.path.join("cgroup.procs"), pid.to_string()).context("write cgroup.procs")?;
         Ok(())
@@ -193,9 +206,7 @@ impl Cgroup {
         let deadline = Instant::now() + timeout;
         let killed_by_kernel = self.write_kill_file()?;
         loop {
-            let events = fs::read_to_string(self.path.join("cgroup.events"))
-                .with_context(|| format!("read {:?}/cgroup.events", self.path))?;
-            if !is_populated(&events)? {
+            if !holds_processes(&self.path)? {
                 return Ok(());
             }
             if Instant::now() > deadline {
