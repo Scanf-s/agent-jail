@@ -8,7 +8,8 @@
 use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Output};
@@ -322,6 +323,31 @@ fn accepts_an_id_that_looks_like_a_unit_name() {
     assert_eq!(states[0]["id"], "web.service");
     fs::write(sandbox.root.join("out/stop"), "").unwrap();
     assert_eq!(wait(&mut aj).code(), Some(0));
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn passes_only_the_standard_streams_to_the_program() {
+    let sandbox = Sandbox::new("fds");
+    // A descriptor that the caller of aj leaves open must not reach the program, because it
+    // refers to a host file.
+    let host_file = File::open("/etc/hostname").unwrap();
+    let host_fd = host_file.as_raw_fd();
+    // With a redirection, the shell would keep a copy of its stdout, so ls prints to stdout.
+    let mut command = sandbox.run_command(&[], &["/bin/sh", "-c", "ls /proc/1/fd; true"]);
+    // SAFETY: dup2 is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            nix::unistd::dup2(host_fd, 9)?;
+            Ok(())
+        });
+    }
+
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let fds = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(fds.split_whitespace().collect::<Vec<_>>(), ["0", "1", "2"]);
 }
 
 #[test]
