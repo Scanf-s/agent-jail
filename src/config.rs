@@ -1,10 +1,16 @@
 use crate::cgroups::CgroupSettings;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Settings the runtime needs to create and run a container.
 pub struct ContainerConfig {
     /// Rootfs path on the host. A relative path is resolved from the current working directory.
     pub rootfs: PathBuf,
+    /// The absolute path that the OCI state reports as the bundle. `run` has no bundle, so it
+    /// reports the rootfs.
+    pub bundle: PathBuf,
+    /// The annotations of the OCI configuration, which the OCI state reports.
+    pub annotations: Option<HashMap<String, String>>,
     pub process: ProcessConfig,
     pub resources: CgroupSettings,
     pub volumes: Vec<Volume>,

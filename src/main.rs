@@ -16,6 +16,7 @@ mod oci;
 mod paths;
 mod runtime;
 mod signals;
+mod state;
 mod user;
 
 #[cfg(target_os = "linux")]
@@ -29,6 +30,7 @@ fn main() -> Result<ExitCode> {
     );
 
     let mapping = user::Mapping::for_current_user()?;
+    let state_root = paths::state_root(cli.root.as_deref())?;
 
     // A run that was killed cannot remove its own run directory, so each command removes the
     // directories that such runs left behind.
@@ -37,11 +39,13 @@ fn main() -> Result<ExitCode> {
     }
 
     match cli.command {
-        cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?, mapping)?.run(),
+        cli::Command::Run(args) => {
+            runtime::Runtime::new(args.into_config()?, mapping, &state_root)?.run()
+        }
         // Validate the whole configuration before Runtime::new creates a cgroup.
         cli::Command::RunBundle { bundle } => {
             let config = oci::Bundle::load(&bundle)?.into_config(&mapping)?;
-            runtime::Runtime::new(config, mapping)?.run()
+            runtime::Runtime::new(config, mapping, &state_root)?.run()
         }
     }
 }

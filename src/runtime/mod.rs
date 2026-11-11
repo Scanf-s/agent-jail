@@ -5,26 +5,33 @@ use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::StartupChannels;
 use crate::network;
 use crate::signals::{self, RuntimeSignals};
+use crate::state::{Record, StateDir};
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setgroups, setuid};
+use std::path::Path;
 use std::process::ExitCode;
 
 pub struct Runtime {
     config: ContainerConfig,
     mapping: Mapping,
+    state_dir: StateDir,
     cgroup: Cgroup,
     run_dir: RunDir,
     channels: Option<StartupChannels>,
 }
 
 impl Runtime {
-    pub fn new(config: ContainerConfig, mapping: Mapping) -> Result<Self> {
+    /// Create the resources of a new container. Its state directory goes under `state_root`.
+    pub fn new(config: ContainerConfig, mapping: Mapping, state_root: &Path) -> Result<Self> {
         // This may replace the process, so it runs before the runtime opens any resource.
         let (delegated, id) = cgroups::enter_delegated_cgroup()?;
+        // If a later step fails, dropping the state directory removes it again.
+        let record = Record::creating(&id, config.bundle.clone(), config.annotations.clone());
+        let state_dir = StateDir::create(state_root, &id, &record)?;
         let cgroup = Cgroup::new(&delegated, &id)?;
         cgroup.configure(&config.resources)?;
         let run_dir = RunDir::create(&id)?;
@@ -34,6 +41,7 @@ impl Runtime {
         Ok(Self {
             config,
             mapping,
+            state_dir,
             cgroup,
             run_dir,
             channels: Some(channels),
@@ -57,6 +65,10 @@ impl Runtime {
         }
         // The setup process removes the run directory. This covers a run that fails before that.
         if let Err(error) = self.run_dir.remove() {
+            eprintln!("aj: warning: {error:#}");
+        }
+        // No process of the container is left, so its state can go.
+        if let Err(error) = self.state_dir.remove() {
             eprintln!("aj: warning: {error:#}");
         }
         result

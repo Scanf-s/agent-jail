@@ -57,6 +57,8 @@ impl RunArgs {
     pub fn into_config(self) -> Result<ContainerConfig> {
         let resources = self.validate()?;
         let rootfs = resolve_rootfs(self.rootfs)?;
+        let bundle = std::path::absolute(&rootfs)
+            .with_context(|| format!("resolve rootfs path {rootfs:?}"))?;
         let volumes = self
             .volumes
             .iter()
@@ -86,6 +88,8 @@ impl RunArgs {
 
         Ok(ContainerConfig {
             rootfs,
+            bundle,
+            annotations: None,
             process: ProcessConfig {
                 args,
                 env,

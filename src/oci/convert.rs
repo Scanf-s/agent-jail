@@ -12,7 +12,7 @@ use std::ops::RangeInclusive;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-const SUPPORTED_OCI_VERSION: &str = "1.3.0";
+pub const SUPPORTED_OCI_VERSION: &str = "1.3.0";
 
 // The runtime always creates exactly these namespaces.
 const REQUIRED_NAMESPACES: [LinuxNamespaceType; 5] = [
@@ -58,6 +58,8 @@ impl Bundle {
 
         Ok(ContainerConfig {
             rootfs,
+            bundle: self.path.clone(),
+            annotations: spec.annotations().clone(),
             process,
             resources,
             volumes: Vec::new(),

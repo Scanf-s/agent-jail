@@ -11,6 +11,10 @@ use super::RunArgs;
     about = "An isolated environment where AI agents can install dependencies and run experiments without root privileges"
 )]
 pub struct Cli {
+    /// Directory for container state [default: $XDG_RUNTIME_DIR/agent-jail].
+    #[arg(long, global = true, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+
     /// The subcommand to dispatch (run, ...).
     #[command(subcommand)]
     pub command: Command,

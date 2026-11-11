@@ -2,10 +2,12 @@
 //! rootfs. They are ignored by default. Run them with `cargo test -- --ignored`.
 //!
 //! The rootfs is `$AJ_TEST_ROOTFS`, or `~/.local/share/agent-jail/images/default` without it.
-//! Each test uses its own `XDG_DATA_HOME`, so it never touches the user's run directories.
+//! Each test uses its own `XDG_DATA_HOME` and `--root`, so it never touches the user's run and
+//! state directories, and tests that run at the same time do not clean up each other's.
 
 use nix::sys::signal::{SigHandler, Signal, kill, signal};
 use nix::unistd::Pid;
+use serde_json::Value;
 use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -33,21 +35,16 @@ impl Sandbox {
 
     /// Start `aj run` with `script` in its own process group, as a shell does for a job.
     fn spawn(&self, script: &str) -> Child {
-        let rootfs = std::env::var_os("AJ_TEST_ROOTFS").map_or_else(
-            || {
-                PathBuf::from(std::env::var_os("HOME").unwrap())
-                    .join(".local/share/agent-jail/images/default")
-            },
-            PathBuf::from,
-        );
         let mut command = Command::new(env!("CARGO_BIN_EXE_aj"));
         command
             .env("XDG_DATA_HOME", self.root.join("data"))
+            .arg("--root")
+            .arg(self.root.join("state"))
             .arg("run")
             .arg("--net")
             .arg("none")
             .arg("--rootfs")
-            .arg(rootfs)
+            .arg(rootfs())
             .arg("-v")
             .arg(format!("{}:/out", self.root.join("out").display()))
             .args(["--", "/bin/sh", "-c", script])
@@ -77,6 +74,32 @@ impl Sandbox {
     fn run_dirs(&self) -> usize {
         fs::read_dir(self.root.join("data/agent-jail/runs")).map_or(0, |entries| entries.count())
     }
+
+    /// The content of each state file under `--root`.
+    fn states(&self) -> Vec<Value> {
+        let Ok(entries) = fs::read_dir(self.root.join("state")) else {
+            return Vec::new();
+        };
+        entries
+            .map(|entry| {
+                let dir = entry.unwrap().path();
+                let state: Value =
+                    serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
+                assert_eq!(state["id"], dir.file_name().unwrap().to_str().unwrap());
+                state
+            })
+            .collect()
+    }
+}
+
+fn rootfs() -> PathBuf {
+    std::env::var_os("AJ_TEST_ROOTFS").map_or_else(
+        || {
+            PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".local/share/agent-jail/images/default")
+        },
+        PathBuf::from,
+    )
 }
 
 impl Drop for Sandbox {
@@ -121,6 +144,25 @@ fn is_running(pid: Pid) -> bool {
         .split_whitespace()
         .next();
     !matches!(state, Some("Z" | "X"))
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn records_the_state_while_the_container_runs() {
+    let sandbox = Sandbox::new("state");
+    let mut aj = sandbox.spawn("touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done");
+    sandbox.wait_until_ready();
+
+    let states = sandbox.states();
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["ociVersion"], "1.3.0");
+    assert_eq!(states[0]["status"], "creating");
+    assert_eq!(states[0]["bundle"], rootfs().to_str().unwrap());
+    assert_eq!(states[0]["autoDelete"], true);
+
+    fs::write(sandbox.root.join("out/stop"), "").unwrap();
+    assert_eq!(wait(&mut aj).code(), Some(0));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
 }
 
 #[test]
