@@ -2,7 +2,10 @@ use super::{Record, STATE_FILE};
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
 use anyhow::{Context, Result, anyhow};
+use nix::errno::Errno;
+use nix::fcntl::{RenameFlags, renameat2};
 use nix::unistd::Pid;
+use rand::random;
 use std::fs::{self, DirBuilder, File};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -38,29 +41,37 @@ impl StateDir {
             .create(root)
             .with_context(|| format!("create {root:?}"))?;
         // The cleanup of stale state directories locks `root` exclusively. While this shared
-        // lock is held, it cannot find the new directory before the directory is locked and
-        // holds a state file.
+        // lock is held, it cannot find the new directory before the directory is locked.
         let _creating =
             lock(open(root)?, LockKind::Shared).with_context(|| format!("lock {root:?}"))?;
-        let path = root.join(id.as_str());
-        match fs::create_dir(&path) {
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(in_use(root, id));
-            }
-            result => result.with_context(|| format!("create {path:?}"))?,
-        }
-        let lock = try_lock(open(&path)?, LockKind::Exclusive)
-            .with_context(|| format!("lock {path:?}"))?
-            .with_context(|| format!("another process holds the lock of {path:?}"))?;
 
-        let dir = Self {
-            path,
+        // The directory gets the name of the ID only after it has its lock and its state file,
+        // so a reader never finds it without them. No ID starts with '.'.
+        let temporary = root.join(format!(".creating-{:016x}", random::<u64>()));
+        fs::create_dir(&temporary).with_context(|| format!("create {temporary:?}"))?;
+        let lock = match lock_new_dir(&temporary) {
+            Ok(lock) => lock,
+            Err(error) => {
+                let _ = fs::remove_dir(&temporary);
+                return Err(error);
+            }
+        };
+        // From here on, dropping `dir` removes the directory if a later step fails.
+        let mut dir = Self {
+            path: temporary,
             record,
             owner: Pid::this(),
             keep: false,
             _lock: lock,
         };
         dir.write()?;
+
+        let path = root.join(id.as_str());
+        match renameat2(None, &dir.path, None, &path, RenameFlags::RENAME_NOREPLACE) {
+            Err(Errno::EEXIST) => return Err(in_use(root, id)),
+            result => result.with_context(|| format!("rename {:?} to {path:?}", dir.path))?,
+        }
+        dir.path = path;
         Ok(dir)
     }
 
@@ -124,6 +135,13 @@ fn open(path: &Path) -> Result<File> {
     File::open(path).with_context(|| format!("open {path:?}"))
 }
 
+/// Lock the directory `path` that this process just created.
+fn lock_new_dir(path: &Path) -> Result<File> {
+    try_lock(open(path)?, LockKind::Exclusive)
+        .with_context(|| format!("lock {path:?}"))?
+        .with_context(|| format!("another process holds the lock of {path:?}"))
+}
+
 fn in_use(root: &Path, id: &ContainerId) -> anyhow::Error {
     anyhow!("a container with ID {id} already exists in {root:?}")
 }
@@ -184,6 +202,17 @@ mod tests {
 
         assert!(error.to_string().contains("already exists"), "{error:#}");
         assert_eq!(read(&first.path).oci.id(), "box1");
+        // The failed run leaves no directory under a temporary name.
+        assert_eq!(entries(&root.0), ["box1"]);
+    }
+
+    fn entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]

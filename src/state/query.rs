@@ -20,8 +20,8 @@ pub fn read(root: &Path, id: &ContainerId) -> Result<Record> {
 
 /// The records of all containers under `root`, as `read` returns them, oldest first.
 ///
-/// A directory without a readable state file, or one that its run removes meanwhile, is left
-/// out. The cleanup of the next run removes such a directory.
+/// A directory that its run removes while this reads it is left out. A directory that cannot
+/// be read is left out with a warning.
 pub fn list(root: &Path) -> Result<Vec<Record>> {
     let entries = match fs::read_dir(root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -30,17 +30,33 @@ pub fn list(root: &Path) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     for entry in entries {
         let entry = entry.with_context(|| format!("read {root:?}"))?;
-        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        // A directory that a runtime is creating has a temporary name, which is no valid ID.
+        let is_container = entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| ContainerId::parse(name).is_ok());
+        if !is_container {
             continue;
         }
         let dir = entry.path();
-        if let Ok(record) = Record::load(&dir).and_then(|record| with_current_status(&dir, record))
-        {
-            records.push(record);
+        match Record::load(&dir).and_then(|record| with_current_status(&dir, record)) {
+            Ok(record) => records.push(record),
+            Err(error) if is_not_found(&error) => {}
+            Err(error) => eprintln!("aj: warning: {error:#}"),
         }
     }
     records.sort_by(|a, b| (a.created, a.oci.id()).cmp(&(b.created, b.oci.id())));
     Ok(records)
+}
+
+/// Whether `error` comes from a file that does not exist.
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::NotFound)
+    })
 }
 
 /// Replace the recorded status with the status that the processes show now.
@@ -231,6 +247,16 @@ mod tests {
         root.leave(&running(record("new", 30), 0));
         root.leave(&record("old", 10));
         fs::create_dir(root.0.join("no-state")).unwrap();
+        fs::create_dir(root.0.join("broken")).unwrap();
+        fs::write(root.0.join("broken").join(STATE_FILE), "{").unwrap();
+        // A runtime that is creating a state directory gives it a name that is no valid ID.
+        let creating = root.0.join(".creating-0123456789abcdef");
+        fs::create_dir(&creating).unwrap();
+        fs::write(
+            creating.join(STATE_FILE),
+            serde_json::to_vec(&record("creating", 20)).unwrap(),
+        )
+        .unwrap();
         fs::write(root.0.join("note"), "").unwrap();
 
         let records = list(&root.0).unwrap();
