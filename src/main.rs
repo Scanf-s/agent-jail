@@ -53,6 +53,10 @@ fn main() -> Result<ExitCode> {
             config.id = Some(id);
             runtime::Runtime::new(config, mapping, &state_root)?.create()
         }
+        cli::Command::Start { id } => {
+            runtime::start(&state_root, &id)?;
+            Ok(ExitCode::SUCCESS)
+        }
         cli::Command::State { id } => {
             let record = state::read(&state_root, &id)?;
             let json = serde_json::to_string_pretty(&record.oci).context("serialize the state")?;

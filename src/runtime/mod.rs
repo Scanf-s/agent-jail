@@ -17,6 +17,7 @@ use nix::unistd::{
     ForkResult, Gid, Pid, Uid, chdir, dup2, fork, setgid, setgroups, setsid, setuid,
 };
 use oci_spec::runtime::ContainerState;
+use start::{StartRequest, StartSocket};
 use startup::Report;
 use std::fs::OpenOptions;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -24,7 +25,10 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
 
+mod start;
 mod startup;
+
+pub use start::start;
 
 /// What the runtime does with a container that it created.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -260,51 +264,52 @@ impl Runtime {
         mode: Mode,
     ) -> Result<()> {
         let (channel, init_channel) = startup::channel()?;
+        let socket = match mode {
+            Mode::Run => None,
+            Mode::Create => Some(StartSocket::listen(&self.state_dir)?),
+        };
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
                 drop(init_channel);
                 // Whether `aj create` reported the container as created.
                 let mut reported = false;
-                let start_at_once = mode == Mode::Run;
-                let code = supervise(
-                    child,
-                    signals,
-                    channel,
-                    start_at_once,
-                    |startup| match startup {
-                        // A created container must report the PID of init, so the program does
-                        // not start without the record.
-                        Startup::Created => {
-                            self.record_created(child, mode)?;
-                            match mode {
-                                Mode::Run => {
-                                    if let Err(error) = ipc.signal_created() {
-                                        report!("aj: warning: {error:#}");
-                                    }
-                                }
-                                // Without the report, `aj create` fails, so the container must
-                                // not stay.
-                                Mode::Create => {
-                                    ipc.signal_created()
-                                        .context("report the container to aj create")?;
-                                    reported = true;
-                                    detach()?;
+                let code = supervise(child, signals, channel, socket, |startup| match startup {
+                    // A created container must report the PID of init, so the program does
+                    // not start without the record.
+                    Startup::Created => {
+                        self.record_created(child, mode)?;
+                        match mode {
+                            Mode::Run => {
+                                if let Err(error) = ipc.signal_created() {
+                                    report!("aj: warning: {error:#}");
                                 }
                             }
-                            Ok(())
-                        }
-                        Startup::Running => {
-                            if let Err(error) = self.record_running() {
-                                report!("aj: warning: {error:#}");
+                            // Without the report, `aj create` fails, so the container must
+                            // not stay.
+                            Mode::Create => {
+                                ipc.signal_created()
+                                    .context("report the container to aj create")?;
+                                reported = true;
+                                detach()?;
                             }
+                        }
+                        Ok(())
+                    }
+                    Startup::Running => match (self.record_running(), mode) {
+                        (Ok(()), _) => Ok(()),
+                        // The run removes the state when the program ends.
+                        (Err(error), Mode::Run) => {
+                            report!("aj: warning: {error:#}");
                             Ok(())
                         }
-                        Startup::Failed(message) => {
-                            report!("aj: container init failed: {message}");
-                            Ok(())
-                        }
+                        // The state would show a program that runs as created.
+                        (Err(error), Mode::Create) => Err(error),
                     },
-                );
+                    Startup::Failed(message) => {
+                        report!("aj: container init failed: {message}");
+                        Ok(())
+                    }
+                });
                 self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
                 // The overlay is already gone, because init's mount namespace ended with it.
@@ -322,7 +327,7 @@ impl Runtime {
                 std::process::exit(i32::from(code?));
             }
             ForkResult::Child => {
-                drop((channel, ipc));
+                drop((channel, ipc, socket));
                 // The locks show that a runtime process is alive. Init is not one, and it can
                 // wait for the start of the program for a long time.
                 self.state_dir.close_lock();
@@ -466,12 +471,12 @@ fn wait_for_setup_process(
 ) -> Result<SetupEvent> {
     loop {
         let event = match &created {
-            Some(pipe) => signals.wait_or_readable(pipe.as_fd()),
+            Some(pipe) => signals.wait_or_readable(&[pipe.as_fd()]),
             None => signals.wait().map(Event::Signal),
         };
         let signal = match event {
             Ok(Event::Signal(signal)) => signal,
-            Ok(Event::Readable) => {
+            Ok(Event::Readable(_)) => {
                 // At EOF, the setup process ended before it reported, and SIGCHLD follows.
                 if let Some(pipe) = created.take()
                     && ipc::read_ready(&pipe, "created")?
@@ -515,18 +520,19 @@ enum Startup {
 /// Wait until container init ends, and return the exit code for the runtime.
 ///
 /// `channel` is the end of the startup channel that the setup process keeps. This passes what
-/// init does before its program runs to `on_startup`. If `start_at_once`, this starts the
-/// program after `on_startup` accepted `Startup::Created`.
+/// init does before its program runs to `on_startup`. After `on_startup` accepted
+/// `Startup::Created`, this starts the program: at once without `socket`, or when `aj start`
+/// asks on `socket`.
 ///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
 fn supervise(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
-    start_at_once: bool,
+    socket: Option<StartSocket>,
     on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
-    let result = wait_for_init(init, signals, channel, start_at_once, on_startup);
+    let result = wait_for_init(init, signals, channel, socket, on_startup);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -538,30 +544,46 @@ fn wait_for_init(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
-    start_at_once: bool,
+    mut socket: Option<StartSocket>,
     mut on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
+    let start_at_once = socket.is_none();
     let mut channel = Some(channel);
+    // Whether init is ready to execute the program.
+    let mut created = false;
     // Whether init was told to execute the program.
     let mut started = false;
+    // The `aj start` that waits until the program runs.
+    let mut request = None;
     // The termination signal for which the runtime killed init.
     let mut termination_signal = None;
     loop {
+        let mut fds = Vec::new();
+        if let Some(channel) = &channel {
+            fds.push(channel.as_fd());
+        }
+        // A request that comes earlier waits in the socket.
+        if created && let Some(socket) = &socket {
+            fds.push(socket.as_fd());
+        }
         // While init starts, signals must still reach this loop. Otherwise Ctrl-C could not end
         // an init that hangs before exec.
-        let event = match &channel {
-            Some(channel) => signals.wait_or_readable(channel.as_fd())?,
-            None => Event::Signal(signals.wait()?),
+        let event = if fds.is_empty() {
+            Event::Signal(signals.wait()?)
+        } else {
+            signals.wait_or_readable(&fds)?
         };
         let signal = match event {
             Event::Signal(signal) => signal,
-            Event::Readable => {
+            // While the channel is open, it comes first.
+            Event::Readable(0) if channel.is_some() => {
                 let Some(open) = &channel else {
                     continue;
                 };
                 match startup::read_report(open)? {
                     Report::Ready => {
                         on_startup(Startup::Created)?;
+                        created = true;
                         if start_at_once {
                             startup::start(open)?;
                             started = true;
@@ -569,10 +591,34 @@ fn wait_for_init(
                     }
                     report => {
                         channel = None;
-                        if let Some(startup) = conclusion(report, started) {
-                            on_startup(startup)?;
-                        }
+                        conclude(conclusion(report, started), &mut on_startup, request.take())?;
                     }
+                }
+                continue;
+            }
+            Event::Readable(_) => {
+                let Some(listening) = &socket else {
+                    continue;
+                };
+                let pending = match listening.accept() {
+                    Ok(Some(pending)) => pending,
+                    Ok(None) => continue,
+                    // A failed connection does not change the container.
+                    Err(error) => {
+                        report!("aj: warning: {error:#}");
+                        continue;
+                    }
+                };
+                // Without the channel, init has ended, and dropping the request tells the
+                // client that the program did not start.
+                let Some(open) = &channel else {
+                    continue;
+                };
+                startup::start(open)?;
+                started = true;
+                request = Some(pending);
+                if let Some(socket) = socket.take() {
+                    socket.close();
                 }
                 continue;
             }
@@ -590,9 +636,11 @@ fn wait_for_init(
                             // The program cannot start any more.
                             Report::Ready => {}
                             report => {
-                                if let Some(startup) = conclusion(report, started) {
-                                    on_startup(startup)?;
-                                }
+                                conclude(
+                                    conclusion(report, started),
+                                    &mut on_startup,
+                                    request.take(),
+                                )?;
                                 break;
                             }
                         }
@@ -623,6 +671,34 @@ fn wait_for_init(
             }
         }
     }
+}
+
+/// Pass `startup`, what the startup channel showed at its end, to `on_startup`, and answer
+/// `request` with the result.
+fn conclude(
+    startup: Option<Startup>,
+    on_startup: &mut impl FnMut(Startup) -> Result<()>,
+    request: Option<StartRequest>,
+) -> Result<()> {
+    let (result, answer) = match startup {
+        Some(Startup::Running) => match on_startup(Startup::Running) {
+            Ok(()) => (Ok(()), Ok(())),
+            Err(error) => {
+                let message = format!("{error:#}");
+                (Err(error), Err(message))
+            }
+        },
+        Some(Startup::Failed(message)) => {
+            (on_startup(Startup::Failed(message.clone())), Err(message))
+        }
+        // The channel ends without a created report. Dropping the request tells the client
+        // that the program did not start.
+        Some(Startup::Created) | None => return Ok(()),
+    };
+    if let Some(request) = request {
+        request.answer(answer);
+    }
+    result
 }
 
 /// What the last report of init on the startup channel shows, if `started` tells whether init

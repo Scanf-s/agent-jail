@@ -116,3 +116,137 @@ fn a_failed_create_leaves_nothing() {
     assert_eq!(sandbox.states(), Vec::<Value>::new());
     assert_eq!(sandbox.run_dirs(), 0);
 }
+
+#[test]
+#[ignore = "starts a container"]
+fn start_runs_the_program_of_a_created_container() {
+    let sandbox = Sandbox::new("start");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    let created = sandbox.create(&bundle, "box");
+    assert!(created.status.success(), "{}", created.stderr);
+    let init = init_of(&sandbox.state("box"));
+
+    let started = sandbox.aj(&["start", "box"]);
+
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    // `aj start` returns after the runtime recorded that the program runs.
+    let state = sandbox.state("box");
+    assert_eq!(state["status"], "running");
+    assert_eq!(init_of(&state), init);
+    let deadline = Instant::now() + TIMEOUT;
+    while fs::read_to_string(&created.stdout).unwrap() != "started\n" {
+        assert!(Instant::now() < deadline, "the program did not print");
+        sleep(Duration::from_millis(20));
+    }
+    assert!(!sandbox.root.join("state/box/start.sock").exists());
+
+    kill(init, Signal::SIGKILL).unwrap();
+    sandbox.wait_for_status("box", "stopped");
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn start_fails_without_effect_unless_the_container_is_created() {
+    let sandbox = Sandbox::new("start-twice");
+    let missing = sandbox.aj(&["start", "box"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no container"));
+
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    assert!(sandbox.aj(&["start", "box"]).status.success());
+    let init = init_of(&sandbox.state("box"));
+
+    let again = sandbox.aj(&["start", "box"]);
+
+    assert!(!again.status.success());
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(stderr.contains("box is running, not created"), "{stderr}");
+    assert_eq!(sandbox.state("box")["status"], "running");
+    kill(init, Signal::SIGKILL).unwrap();
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn only_one_of_two_starts_runs_the_program() {
+    let sandbox = Sandbox::new("start-race");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    let init = init_of(&sandbox.state("box"));
+
+    let outputs: Vec<_> = std::thread::scope(|scope| {
+        let starts: Vec<_> = (0..2)
+            .map(|_| scope.spawn(|| sandbox.aj(&["start", "box"])))
+            .collect();
+        starts
+            .into_iter()
+            .map(|start| start.join().unwrap())
+            .collect()
+    });
+
+    let succeeded = outputs.iter().filter(|output| output.status.success());
+    assert_eq!(succeeded.count(), 1, "{outputs:?}");
+    let failed = outputs
+        .iter()
+        .find(|output| !output.status.success())
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("box is running, not created") || stderr.contains("already starting"),
+        "{stderr}"
+    );
+    kill(init, Signal::SIGKILL).unwrap();
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn start_reports_a_program_that_cannot_run() {
+    let sandbox = Sandbox::new("start-no-program");
+    let bundle = sandbox.bundle(&["/no/such/program"], "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+
+    let started = sandbox.aj(&["start", "box"]);
+
+    assert!(!started.status.success());
+    let stderr = String::from_utf8_lossy(&started.stderr);
+    assert!(stderr.contains(r#"exec "/no/such/program""#), "{stderr}");
+    sandbox.wait_for_status("box", "stopped");
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn start_succeeds_for_a_program_that_ends_at_once() {
+    let sandbox = Sandbox::new("start-true");
+    let bundle = sandbox.bundle(&["/bin/true"], "/");
+    for id in ["box1", "box2", "box3"] {
+        assert!(sandbox.create(&bundle, id).status.success());
+
+        let started = sandbox.aj(&["start", id]);
+
+        assert!(
+            started.status.success(),
+            "{}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        sandbox.wait_for_status(id, "stopped");
+    }
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn a_started_container_ends_with_its_setup_process() {
+    let sandbox = Sandbox::new("start-setup-killed");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    assert!(sandbox.aj(&["start", "box"]).status.success());
+    let init = init_of(&sandbox.state("box"));
+
+    kill(parent_of(init), Signal::SIGKILL).unwrap();
+
+    wait_until_ended(init);
+    assert_eq!(sandbox.state("box")["status"], "stopped");
+}

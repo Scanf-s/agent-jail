@@ -40,6 +40,12 @@ pub enum Command {
         #[arg(value_parser = ContainerId::parse)]
         id: ContainerId,
     },
+    /// Start the program of a created container.
+    Start {
+        /// Container ID.
+        #[arg(value_parser = ContainerId::parse)]
+        id: ContainerId,
+    },
     /// Print the OCI state of a container as JSON.
     State {
         /// Container ID.
@@ -162,6 +168,16 @@ mod tests {
         assert_eq!(bundle, PathBuf::from("."));
         assert!(Cli::try_parse_from(["aj", "create"]).is_err());
         assert!(Cli::try_parse_from(["aj", "create", "-box"]).is_err());
+    }
+
+    #[test]
+    fn parses_start() {
+        let cli = Cli::try_parse_from(["aj", "start", "box1"]).unwrap();
+        let Command::Start { id } = cli.command else {
+            panic!("expected the start command");
+        };
+        assert_eq!(id.as_str(), "box1");
+        assert!(Cli::try_parse_from(["aj", "start"]).is_err());
     }
 
     #[test]
