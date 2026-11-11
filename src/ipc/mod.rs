@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 const READY: u8 = 1;
 
-fn send_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
+pub(crate) fn send_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
     loop {
         match write(fd, &[READY]) {
             Ok(1) => return Ok(()),
@@ -31,7 +31,7 @@ fn send_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
     }
 }
 
-fn wait_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
+pub(crate) fn wait_ready(fd: &OwnedFd, stage: &str) -> Result<()> {
     let mut byte = [0u8; 1];
     loop {
         match read(fd.as_raw_fd(), &mut byte) {

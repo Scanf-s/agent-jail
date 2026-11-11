@@ -1,8 +1,12 @@
+use crate::container_id::ContainerId;
 use crate::paths;
+use crate::user::{Mapping, run_in_user_namespace};
 use anyhow::{Context, Result};
-use rand::random;
-use std::fs;
+use nix::errno::Errno;
+use nix::libc;
+use std::fs::{self, File};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The directories that one run uses for its overlay root filesystem.
@@ -10,19 +14,30 @@ use std::path::{Path, PathBuf};
 /// The container writes into `upper`, so the rootfs itself never changes.
 pub struct RunDir {
     path: PathBuf,
+    // An exclusive flock on the directory shows that the run is alive. The forked processes
+    // share this open file, and the kernel releases the lock when the last of them closes it or
+    // ends, even when they are killed. `remove_stale` removes only directories whose lock is free.
+    _lock: File,
 }
 
 impl RunDir {
-    /// Create a new run directory under `$XDG_DATA_HOME/agent-jail/runs`.
-    pub fn create() -> Result<Self> {
-        Self::create_in(&paths::data_dir()?.join("runs"))
+    /// Create the run directory of container `id` under `$XDG_DATA_HOME/agent-jail/runs`.
+    pub fn create(id: &ContainerId) -> Result<Self> {
+        Self::create_in(&runs_dir()?, id)
     }
 
-    fn create_in(runs: &Path) -> Result<Self> {
+    fn create_in(runs: &Path, id: &ContainerId) -> Result<Self> {
         fs::create_dir_all(runs).with_context(|| format!("create {runs:?}"))?;
-        let path = runs.join(format!("{:x}", random::<u64>()));
+        // `remove_stale` locks `runs` exclusively, so it never finds the new directory in the
+        // short time before the directory is locked.
+        let _creating =
+            flock(open(runs)?, libc::LOCK_SH).with_context(|| format!("lock {runs:?}"))?;
+        let path = runs.join(id.as_str());
         fs::create_dir(&path).with_context(|| format!("create {path:?}"))?;
-        let run_dir = Self { path };
+        let lock = flock(open(&path)?, libc::LOCK_EX | libc::LOCK_NB)
+            .with_context(|| format!("lock {path:?}"))?;
+
+        let run_dir = Self { path, _lock: lock };
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             fs::create_dir(&dir).with_context(|| format!("create {dir:?}"))?;
         }
@@ -49,11 +64,98 @@ impl RunDir {
     /// Files that container users other than root create belong to subordinate IDs, so only a
     /// process inside the container's user namespace can remove all of them.
     pub fn remove(&self) -> Result<()> {
-        match fs::remove_dir_all(&self.path) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                Err(error).with_context(|| format!("remove run directory {:?}", self.path))
+        remove_dir(&self.path)
+    }
+}
+
+/// Remove the run directories that no live run holds. A run that is killed, for example with
+/// SIGKILL, cannot remove its own directory.
+pub fn remove_stale(mapping: &Mapping) -> Result<()> {
+    let stale = find_stale(&runs_dir()?)?;
+    if stale.is_empty() {
+        return Ok(());
+    }
+    run_in_user_namespace(mapping, || {
+        let mut result = Ok(());
+        // The locks stay held until the removal ends, so another runtime skips these directories.
+        for (path, _lock) in &stale {
+            if let Err(error) = remove_dir(path) {
+                result = Err(error);
             }
-            _ => Ok(()),
+        }
+        result
+    })
+}
+
+/// Lock and return the run directories whose lock is free.
+fn find_stale(runs: &Path) -> Result<Vec<(PathBuf, File)>> {
+    let runs_file = match File::open(runs) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        result => result.with_context(|| format!("open {runs:?}"))?,
+    };
+    // A runtime that is creating its run directory holds a shared lock. Waiting for it could
+    // block for as long as that runtime is stopped, so this run skips the cleanup instead.
+    let Some(_no_creation) = try_lock(runs_file).with_context(|| format!("lock {runs:?}"))? else {
+        return Ok(Vec::new());
+    };
+
+    let mut stale = Vec::new();
+    for entry in fs::read_dir(runs).with_context(|| format!("read {runs:?}"))? {
+        let entry = entry.with_context(|| format!("read {runs:?}"))?;
+        // file_type does not follow symbolic links, so only real directories are removed.
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let dir = match File::open(&path) {
+            // The run removed its own directory after read_dir listed it.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            result => result.with_context(|| format!("open {path:?}"))?,
+        };
+        if let Some(dir) = try_lock(dir).with_context(|| format!("lock {path:?}"))? {
+            stale.push((path, dir));
+        }
+    }
+    Ok(stale)
+}
+
+fn runs_dir() -> Result<PathBuf> {
+    Ok(paths::data_dir()?.join("runs"))
+}
+
+fn open(path: &Path) -> Result<File> {
+    File::open(path).with_context(|| format!("open {path:?}"))
+}
+
+fn remove_dir(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(error).with_context(|| format!("remove run directory {path:?}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Lock `file` exclusively without waiting. Returns `None` if another open file holds the lock.
+fn try_lock(file: File) -> io::Result<Option<File>> {
+    match flock(file, libc::LOCK_EX | libc::LOCK_NB) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+        result => result.map(Some),
+    }
+}
+
+/// Apply flock `operation` to `file`.
+///
+/// `nix::fcntl::Flock` calls LOCK_UN when it is dropped. That would release the lock for every
+/// forked process that shares the open file. Without that call, the kernel releases the lock
+/// only when the last descriptor that refers to the open file is closed.
+fn flock(file: File, operation: libc::c_int) -> io::Result<File> {
+    loop {
+        // SAFETY: flock only uses the descriptor number, and `file` keeps the descriptor open.
+        match Errno::result(unsafe { libc::flock(file.as_raw_fd(), operation) }) {
+            Ok(_) => return Ok(file),
+            Err(Errno::EINTR) => continue,
+            Err(errno) => return Err(errno.into()),
         }
     }
 }
@@ -61,11 +163,37 @@ impl RunDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::random;
+
+    struct TempRuns(PathBuf);
+
+    impl TempRuns {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("agent-jail-runs-{:x}", random::<u64>())))
+        }
+
+        fn names(stale: &[(PathBuf, File)]) -> Vec<String> {
+            let mut names: Vec<String> = stale
+                .iter()
+                .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for TempRuns {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn creates_and_removes_the_overlay_directories() {
-        let runs = std::env::temp_dir().join(format!("agent-jail-runs-{:x}", random::<u64>()));
-        let run_dir = RunDir::create_in(&runs).unwrap();
+        let runs = TempRuns::new();
+        let id = ContainerId::generate();
+        let run_dir = RunDir::create_in(&runs.0, &id).unwrap();
+        assert_eq!(run_dir.path, runs.0.join(id.as_str()));
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             assert!(dir.is_dir(), "{dir:?} is missing");
         }
@@ -74,6 +202,41 @@ mod tests {
         assert!(!run_dir.path.exists());
         // A second removal finds nothing to do.
         run_dir.remove().unwrap();
-        fs::remove_dir(runs).unwrap();
+    }
+
+    #[test]
+    fn finds_only_run_directories_that_no_run_holds() {
+        let runs = TempRuns::new();
+        let live =
+            RunDir::create_in(&runs.0, &ContainerId::parse("aaaaaaaaaaaaaaaa").unwrap()).unwrap();
+        fs::create_dir(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
+        fs::write(runs.0.join("note"), "").unwrap();
+
+        let stale = find_stale(&runs.0).unwrap();
+        assert_eq!(TempRuns::names(&stale), ["bbbbbbbbbbbbbbbb"]);
+        // While the first cleanup holds its locks, a second one finds nothing.
+        assert!(find_stale(&runs.0).unwrap().is_empty());
+        drop(stale);
+
+        drop(live);
+        assert_eq!(
+            TempRuns::names(&find_stale(&runs.0).unwrap()),
+            ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]
+        );
+    }
+
+    #[test]
+    fn skips_the_cleanup_while_a_run_directory_is_created() {
+        let runs = TempRuns::new();
+        fs::create_dir_all(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
+        let _creating = flock(File::open(&runs.0).unwrap(), libc::LOCK_SH).unwrap();
+
+        assert!(find_stale(&runs.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn finds_nothing_without_a_runs_directory() {
+        let runs = TempRuns::new();
+        assert!(find_stale(&runs.0).unwrap().is_empty());
     }
 }
