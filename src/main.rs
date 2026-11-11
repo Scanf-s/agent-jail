@@ -9,6 +9,7 @@ mod config;
 mod container;
 mod container_id;
 mod filesystem;
+mod flock;
 mod ipc;
 mod network;
 mod oci;

@@ -1,12 +1,10 @@
 use crate::container_id::ContainerId;
+use crate::flock::{LockKind, lock, try_lock};
 use crate::paths;
 use crate::user::{Mapping, run_in_user_namespace};
 use anyhow::{Context, Result};
-use nix::errno::Errno;
-use nix::libc;
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// The directories that one run uses for its overlay root filesystem.
@@ -31,11 +29,12 @@ impl RunDir {
         // `remove_stale` locks `runs` exclusively, so it never finds the new directory in the
         // short time before the directory is locked.
         let _creating =
-            flock(open(runs)?, libc::LOCK_SH).with_context(|| format!("lock {runs:?}"))?;
+            lock(open(runs)?, LockKind::Shared).with_context(|| format!("lock {runs:?}"))?;
         let path = runs.join(id.as_str());
         fs::create_dir(&path).with_context(|| format!("create {path:?}"))?;
-        let lock = flock(open(&path)?, libc::LOCK_EX | libc::LOCK_NB)
-            .with_context(|| format!("lock {path:?}"))?;
+        let lock = try_lock(open(&path)?, LockKind::Exclusive)
+            .with_context(|| format!("lock {path:?}"))?
+            .with_context(|| format!("another process holds the lock of {path:?}"))?;
 
         let run_dir = Self { path, _lock: lock };
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
@@ -95,7 +94,9 @@ fn find_stale(runs: &Path) -> Result<Vec<(PathBuf, File)>> {
     };
     // A runtime that is creating its run directory holds a shared lock. Waiting for it could
     // block for as long as that runtime is stopped, so this run skips the cleanup instead.
-    let Some(_no_creation) = try_lock(runs_file).with_context(|| format!("lock {runs:?}"))? else {
+    let Some(_no_creation) =
+        try_lock(runs_file, LockKind::Exclusive).with_context(|| format!("lock {runs:?}"))?
+    else {
         return Ok(Vec::new());
     };
 
@@ -112,7 +113,9 @@ fn find_stale(runs: &Path) -> Result<Vec<(PathBuf, File)>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             result => result.with_context(|| format!("open {path:?}"))?,
         };
-        if let Some(dir) = try_lock(dir).with_context(|| format!("lock {path:?}"))? {
+        if let Some(dir) =
+            try_lock(dir, LockKind::Exclusive).with_context(|| format!("lock {path:?}"))?
+        {
             stale.push((path, dir));
         }
     }
@@ -133,30 +136,6 @@ fn remove_dir(path: &Path) -> Result<()> {
             Err(error).with_context(|| format!("remove run directory {path:?}"))
         }
         _ => Ok(()),
-    }
-}
-
-/// Lock `file` exclusively without waiting. Returns `None` if another open file holds the lock.
-fn try_lock(file: File) -> io::Result<Option<File>> {
-    match flock(file, libc::LOCK_EX | libc::LOCK_NB) {
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        result => result.map(Some),
-    }
-}
-
-/// Apply flock `operation` to `file`.
-///
-/// `nix::fcntl::Flock` calls LOCK_UN when it is dropped. That would release the lock for every
-/// forked process that shares the open file. Without that call, the kernel releases the lock
-/// only when the last descriptor that refers to the open file is closed.
-fn flock(file: File, operation: libc::c_int) -> io::Result<File> {
-    loop {
-        // SAFETY: flock only uses the descriptor number, and `file` keeps the descriptor open.
-        match Errno::result(unsafe { libc::flock(file.as_raw_fd(), operation) }) {
-            Ok(_) => return Ok(file),
-            Err(Errno::EINTR) => continue,
-            Err(errno) => return Err(errno.into()),
-        }
     }
 }
 
@@ -229,7 +208,7 @@ mod tests {
     fn skips_the_cleanup_while_a_run_directory_is_created() {
         let runs = TempRuns::new();
         fs::create_dir_all(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
-        let _creating = flock(File::open(&runs.0).unwrap(), libc::LOCK_SH).unwrap();
+        let _creating = lock(File::open(&runs.0).unwrap(), LockKind::Shared).unwrap();
 
         assert!(find_stale(&runs.0).unwrap().is_empty());
     }
