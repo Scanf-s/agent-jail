@@ -19,7 +19,8 @@ const TEMPORARY_FILE: &str = "state.json.tmp";
 /// it starts leaves nothing behind. `keep` stops that.
 pub struct StateDir {
     path: PathBuf,
-    /// What the state file holds now.
+    /// `update` writes all of it. If a write fails, the file keeps the record of the last
+    /// successful write, and the next successful write includes the missed change.
     record: Record,
     /// The process that created the directory. The setup process and container init have a
     /// copy after fork, and a panic there would drop it while the container still runs.
@@ -144,7 +145,6 @@ fn open(path: &Path) -> Result<File> {
     File::open(path).with_context(|| format!("open {path:?}"))
 }
 
-/// Lock the directory `path` that this process just created.
 fn lock_new_dir(path: &Path) -> Result<File> {
     try_lock(open(path)?, LockKind::Exclusive)
         .with_context(|| format!("lock {path:?}"))?

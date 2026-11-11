@@ -15,7 +15,6 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const REQUIRED_CONTROLLERS: [&str; 3] = ["memory", "cpu", "pids"];
 // The runtime moves itself here so that the delegated cgroup holds no process.
 const RUNTIME_LEAF: &str = "runtime";
-// How long `Cgroup::kill_all` waits for the killed processes to end.
 const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn check_controllers(available: &str) -> Result<()> {

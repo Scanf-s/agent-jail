@@ -42,7 +42,6 @@ struct Scan {
     // this exclusive lock is held, no runtime can create a directory at the path of one that
     // this cleanup removes.
     _root_lock: File,
-    /// The stale directories, each with its exclusive lock.
     stale: Vec<(PathBuf, File)>,
     /// Errors for single directories. Those directories stay, and the cleanup goes on.
     errors: Vec<anyhow::Error>,

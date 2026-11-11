@@ -11,8 +11,8 @@ use std::process::Command;
 // The scope name shows that the runtime started it, so a second failure stops instead of looping.
 // It also carries the container ID across the exec into the scope.
 const SCOPE_PREFIX: &str = "agent-jail-";
-// systemd-run adds this only to a name without a unit type suffix. Without it, an ID such as
-// `web.service` would name a service unit.
+// systemd-run guesses the unit type from the end of a name that has no type. With an explicit
+// type, the name never depends on that guess, whatever characters the ID contains.
 const SCOPE_SUFFIX: &str = ".scope";
 
 /// Return the delegated cgroup that the runtime runs in, and the ID of the container:
