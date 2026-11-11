@@ -50,6 +50,11 @@ impl Runtime {
 
     fn run_parent(&mut self, child: Pid, signals: &RuntimeSignals) -> Result<ExitCode> {
         let result = self.wait_for_container(child, signals);
+        // If the setup process ended before container init, init still runs, and nothing else
+        // would end it.
+        if let Err(error) = self.cgroup.kill_all() {
+            eprintln!("aj: warning: end the processes left in the container: {error:#}");
+        }
         // The setup process removes the run directory. This covers a run that fails before that.
         if let Err(error) = self.run_dir.remove() {
             eprintln!("aj: warning: {error:#}");

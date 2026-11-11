@@ -103,6 +103,26 @@ fn signal_group(child: &Child, signal: Signal) {
     kill(Pid::from_raw(-(child.id() as i32)), signal).unwrap();
 }
 
+/// The only child process of `pid`.
+fn only_child(pid: Pid) -> Pid {
+    let children = fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).unwrap();
+    let children: Vec<&str> = children.split_whitespace().collect();
+    assert_eq!(children.len(), 1, "process {pid} has children {children:?}");
+    Pid::from_raw(children[0].parse().unwrap())
+}
+
+/// Whether `pid` runs. A zombie has ended and only waits for its parent to reap it.
+fn is_running(pid: Pid) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    // The state follows the command name, which is in parentheses and may contain spaces.
+    let state = stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .next();
+    !matches!(state, Some("Z" | "X"))
+}
+
 #[test]
 #[ignore = "starts a container"]
 fn ctrl_c_ends_a_pid_1_program_and_removes_the_run_directory() {
@@ -155,6 +175,26 @@ fn sigterm_to_the_runtime_ends_the_container() {
     kill(Pid::from_raw(aj.id() as i32), Signal::SIGTERM).unwrap();
 
     assert_eq!(wait(&mut aj).code(), Some(143));
+    assert_eq!(sandbox.run_dirs(), 0);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn container_init_ends_when_only_the_setup_process_is_killed() {
+    let sandbox = Sandbox::new("setup-killed");
+    let mut aj = sandbox.spawn("touch /out/ready && exec sleep 60");
+    sandbox.wait_until_ready();
+    let setup = only_child(Pid::from_raw(aj.id() as i32));
+    let init = only_child(setup);
+
+    kill(setup, Signal::SIGKILL).unwrap();
+
+    assert_eq!(wait(&mut aj).code(), Some(137));
+    assert!(!is_running(init), "container init outlived the runtime");
+    // Only a process in the user namespace can remove the overlay's work directory, so the
+    // next run removes the run directory.
+    let mut next = sandbox.spawn("true");
+    assert_eq!(wait(&mut next).code(), Some(0));
     assert_eq!(sandbox.run_dirs(), 0);
 }
 
