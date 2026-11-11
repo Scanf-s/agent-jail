@@ -1,14 +1,21 @@
 use crate::container_id::ContainerId;
+use crate::paths;
 use anyhow::{Context, Result, bail};
+use nix::errno::Errno;
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::{AccessFlags, Pid, access};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const REQUIRED_CONTROLLERS: [&str; 3] = ["memory", "cpu", "pids"];
 // The runtime moves itself here so that the delegated cgroup holds no process.
 const RUNTIME_LEAF: &str = "runtime";
+const KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn check_controllers(available: &str) -> Result<()> {
     let available: Vec<&str> = available.split_whitespace().collect();
@@ -60,6 +67,53 @@ pub fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
     let available = fs::read_to_string(dir.join("cgroup.controllers"))
         .with_context(|| format!("read {dir:?}/cgroup.controllers"))?;
     check_controllers(&available).with_context(|| format!("cgroup {dir:?}"))
+}
+
+/// Whether the cgroup `path` or one of its descendants holds a process. A cgroup that does not
+/// exist holds none.
+pub fn holds_processes(path: &Path) -> Result<bool> {
+    match fs::read_to_string(path.join("cgroup.events")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        result => is_populated(&result.with_context(|| format!("read {path:?}/cgroup.events"))?),
+    }
+}
+
+/// Whether `cgroup.events` reports a process in the cgroup or in one of its descendants.
+fn is_populated(events: &str) -> Result<bool> {
+    let value = events
+        .lines()
+        .find_map(|line| line.strip_prefix("populated "))
+        .context("no populated line in cgroup.events")?;
+    match value.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        other => bail!("unexpected populated value {other:?} in cgroup.events"),
+    }
+}
+
+/// Send SIGKILL to the processes in the cgroup `dir` and in its descendants.
+fn kill_listed_processes(dir: &Path) -> Result<()> {
+    let procs = match fs::read_to_string(dir.join("cgroup.procs")) {
+        // A descendant cgroup can be removed while this walks the tree.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        result => result.with_context(|| format!("read {dir:?}/cgroup.procs"))?,
+    };
+    for pid in procs.split_whitespace() {
+        let pid: i32 = pid.parse().with_context(|| format!("parse PID {pid:?}"))?;
+        match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            // The process can end by itself after the read.
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(errno) => return Err(errno).with_context(|| format!("kill process {pid}")),
+        }
+    }
+    for entry in fs::read_dir(dir).with_context(|| format!("read {dir:?}"))? {
+        let entry = entry.with_context(|| format!("read {dir:?}"))?;
+        let path = entry.path();
+        if paths::is_directory(&entry).with_context(|| format!("read {path:?}"))? {
+            kill_listed_processes(&path)?;
+        }
+    }
+    Ok(())
 }
 
 // Resource limits for the container's cgroup.
@@ -136,9 +190,57 @@ impl Cgroup {
         Ok(())
     }
 
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn add_pid(&self, pid: nix::unistd::Pid) -> Result<()> {
         fs::write(self.path.join("cgroup.procs"), pid.to_string()).context("write cgroup.procs")?;
         Ok(())
+    }
+
+    /// Kill every process in the cgroup and its descendants, and wait until they end.
+    ///
+    /// The setup process is in this cgroup, so the OOM killer can end it alone. Container init
+    /// then keeps running with no process that waits for it or cleans up after it.
+    pub fn kill_all(&self) -> Result<()> {
+        self.kill_all_within(KILL_TIMEOUT)
+    }
+
+    fn kill_all_within(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let killed_by_kernel = self.write_kill_file()?;
+        loop {
+            if !holds_processes(&self.path)? {
+                return Ok(());
+            }
+            if Instant::now() > deadline {
+                bail!(
+                    "processes in {:?} did not end within {timeout:?}",
+                    self.path
+                );
+            }
+            // Without cgroup.kill, a process can fork after the list was read, so this repeats.
+            if !killed_by_kernel {
+                kill_listed_processes(&self.path)?;
+            }
+            sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Ask the kernel to kill every process in the cgroup. Returns false if the kernel is older
+    /// than Linux 5.14, which has no `cgroup.kill`.
+    fn write_kill_file(&self) -> Result<bool> {
+        let path = self.path.join("cgroup.kill");
+        // Without `create`, a missing file fails with NotFound instead of being created.
+        match OpenOptions::new().write(true).open(&path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            file => {
+                file.and_then(|mut file| file.write_all(b"1"))
+                    .with_context(|| format!("write {path:?}"))?;
+                Ok(true)
+            }
+        }
     }
 
     fn set_memory_max(&self, bytes: u64) -> Result<()> {
@@ -176,6 +278,7 @@ mod tests {
     use super::*;
     use rand::random;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
 
     struct TempDir(PathBuf);
 
@@ -371,6 +474,82 @@ mod tests {
         assert!(!temp.0.join("memory.max").exists());
         assert!(!temp.0.join("memory.swap.max").exists());
         assert_eq!(fs::read_to_string(temp.0.join("pids.max")).unwrap(), "64");
+    }
+
+    #[test]
+    fn reads_whether_the_cgroup_holds_processes() {
+        let events = "populated 1\nfrozen 0\n";
+        assert!(is_populated(events).unwrap());
+        assert!(!is_populated("populated 0\nfrozen 0\n").unwrap());
+        assert!(is_populated("frozen 0\n").is_err());
+        assert!(is_populated("populated x\n").is_err());
+    }
+
+    #[test]
+    fn kills_with_the_kill_file_when_the_kernel_has_one() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("cgroup.kill"), "").unwrap();
+        fs::write(temp.0.join("cgroup.events"), "populated 0\n").unwrap();
+        let cgroup = Cgroup {
+            path: temp.0.clone(),
+        };
+
+        cgroup.kill_all().unwrap();
+
+        assert_eq!(fs::read_to_string(temp.0.join("cgroup.kill")).unwrap(), "1");
+    }
+
+    #[test]
+    fn works_without_a_kill_file() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("cgroup.events"), "populated 0\n").unwrap();
+        let cgroup = Cgroup {
+            path: temp.0.clone(),
+        };
+
+        cgroup.kill_all().unwrap();
+
+        assert!(!temp.0.join("cgroup.kill").exists());
+    }
+
+    #[test]
+    fn kills_the_processes_that_the_cgroup_tree_lists() {
+        let temp = TempDir::new();
+        let child_cgroup = temp.0.join("child");
+        fs::create_dir(&child_cgroup).unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        fs::write(temp.0.join("cgroup.procs"), "").unwrap();
+        fs::write(
+            child_cgroup.join("cgroup.procs"),
+            format!("{}\n", sleeper.id()),
+        )
+        .unwrap();
+
+        kill_listed_processes(&temp.0).unwrap();
+
+        assert_eq!(
+            sleeper.wait().unwrap().signal(),
+            Some(Signal::SIGKILL as i32)
+        );
+    }
+
+    #[test]
+    fn reports_processes_that_do_not_end() {
+        let temp = TempDir::new();
+        fs::write(temp.0.join("cgroup.kill"), "").unwrap();
+        fs::write(temp.0.join("cgroup.events"), "populated 1\n").unwrap();
+        let cgroup = Cgroup {
+            path: temp.0.clone(),
+        };
+
+        let error = cgroup
+            .kill_all_within(Duration::from_millis(50))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("did not end"), "{error:#}");
     }
 
     #[test]

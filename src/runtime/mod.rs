@@ -4,29 +4,50 @@ use crate::container;
 use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::StartupChannels;
 use crate::network;
-use crate::signals::{self, RuntimeSignals};
+use crate::proc_stat;
+use crate::signals::{self, Event, RuntimeSignals};
+use crate::state::{Record, StateDir};
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
+use nix::fcntl::OFlag;
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setgroups, setuid};
+use nix::unistd::{
+    ForkResult, Gid, Pid, Uid, chdir, fork, pipe2, read, setgid, setgroups, setuid, write,
+};
+use oci_spec::runtime::ContainerState;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::path::Path;
 use std::process::ExitCode;
 
 pub struct Runtime {
     config: ContainerConfig,
     mapping: Mapping,
+    state_dir: StateDir,
     cgroup: Cgroup,
     run_dir: RunDir,
     channels: Option<StartupChannels>,
 }
 
 impl Runtime {
-    pub fn new(config: ContainerConfig, mapping: Mapping) -> Result<Self> {
+    /// Create the resources of a new container. Its state directory goes under `state_root`.
+    pub fn new(config: ContainerConfig, mapping: Mapping, state_root: &Path) -> Result<Self> {
+        if let Some(id) = &config.id {
+            StateDir::check_unused(state_root, id)?;
+        }
         // This may replace the process, so it runs before the runtime opens any resource.
-        let (delegated, id) = cgroups::enter_delegated_cgroup()?;
+        let (delegated, id) = cgroups::enter_delegated_cgroup(config.id.as_ref())?;
+        // If a later step fails, dropping the cgroup and the state directory removes them again.
         let cgroup = Cgroup::new(&delegated, &id)?;
         cgroup.configure(&config.resources)?;
+        let record = Record::creating(
+            &id,
+            cgroup.path().to_owned(),
+            config.bundle.clone(),
+            config.annotations.clone(),
+        );
+        let state_dir = StateDir::create(state_root, &id, record)?;
         let run_dir = RunDir::create(&id)?;
 
         let channels = StartupChannels::new()?;
@@ -34,6 +55,7 @@ impl Runtime {
         Ok(Self {
             config,
             mapping,
+            state_dir,
             cgroup,
             run_dir,
             channels: Some(channels),
@@ -50,9 +72,28 @@ impl Runtime {
 
     fn run_parent(&mut self, child: Pid, signals: &RuntimeSignals) -> Result<ExitCode> {
         let result = self.wait_for_container(child, signals);
+        // If the setup process ended before container init, init still runs, and nothing else
+        // would end it.
+        let ended = self.cgroup.kill_all();
         // The setup process removes the run directory. This covers a run that fails before that.
         if let Err(error) = self.run_dir.remove() {
             eprintln!("aj: warning: {error:#}");
+        }
+        match ended {
+            Ok(()) => {
+                if let Err(error) = self.state_dir.remove() {
+                    eprintln!("aj: warning: {error:#}");
+                }
+            }
+            // The state keeps the container visible in `aj list` and its ID in use while its
+            // processes may still run.
+            Err(error) => {
+                eprintln!(
+                    "aj: warning: end the processes left in the container, so its state stays: \
+                     {error:#}"
+                );
+                self.state_dir.keep();
+            }
         }
         result
     }
@@ -131,10 +172,19 @@ impl Runtime {
         self.launch_init(signals)
     }
 
-    fn launch_init(&self, signals: &RuntimeSignals) -> Result<()> {
+    fn launch_init(&mut self, signals: &RuntimeSignals) -> Result<()> {
+        // Container init writes a byte to this pipe if it fails before the program runs. The
+        // write end has O_CLOEXEC, so a successful exec closes it, and the setup process reads
+        // EOF instead.
+        let (startup_reader, startup_writer) =
+            pipe2(OFlag::O_CLOEXEC).context("create the startup pipe")?;
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
-                let code = supervise(child, signals);
+                drop(startup_writer);
+                let code = supervise(child, signals, startup_reader, || {
+                    self.record_running(child);
+                });
+                self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
                 // The overlay is already gone, because init's mount namespace ended with it.
                 if let Err(error) = self.run_dir.remove() {
@@ -143,12 +193,41 @@ impl Runtime {
                 std::process::exit(i32::from(code?));
             }
             ForkResult::Child => {
+                drop(startup_reader);
                 if let Err(error) = self.run_init() {
                     eprintln!("aj: container init failed: {error:#}");
+                    let _ = write(&startup_writer, &[1]);
                     std::process::exit(127);
                 }
                 unreachable!("container init returned without executing command");
             }
+        }
+    }
+
+    fn record_running(&mut self, init: Pid) {
+        let result = (|| -> Result<()> {
+            let start_time = proc_stat::start_time(init)?;
+            self.state_dir.update(|record| {
+                record
+                    .oci
+                    .set_status(ContainerState::Running)
+                    .set_pid(Some(init.as_raw()));
+                record.init_start_time = Some(start_time);
+            })
+        })();
+        if let Err(error) = result {
+            eprintln!("aj: warning: record that the container runs: {error:#}");
+        }
+    }
+
+    /// Record that the container program ended, with its exit code if the runtime knows it.
+    fn record_stopped(&mut self, exit_code: Option<u8>) {
+        let result = self.state_dir.update(|record| {
+            record.oci.set_status(ContainerState::Stopped);
+            record.exit_code = exit_code;
+        });
+        if let Err(error) = result {
+            eprintln!("aj: warning: record that the container stopped: {error:#}");
         }
     }
 
@@ -221,9 +300,17 @@ fn wait_for_setup_process(child: Pid, signals: &RuntimeSignals) -> Result<WaitSt
 
 /// Wait until container init ends, and return the exit code for the runtime.
 ///
+/// `startup` is the read end of the startup pipe. When it shows that init runs the container
+/// program, this calls `on_running`.
+///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
-fn supervise(init: Pid, signals: &RuntimeSignals) -> Result<u8> {
-    let result = wait_for_init(init, signals);
+fn supervise(
+    init: Pid,
+    signals: &RuntimeSignals,
+    startup: OwnedFd,
+    on_running: impl FnMut(),
+) -> Result<u8> {
+    let result = wait_for_init(init, signals, startup, on_running);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -231,11 +318,40 @@ fn supervise(init: Pid, signals: &RuntimeSignals) -> Result<u8> {
     result
 }
 
-fn wait_for_init(init: Pid, signals: &RuntimeSignals) -> Result<u8> {
+fn wait_for_init(
+    init: Pid,
+    signals: &RuntimeSignals,
+    startup: OwnedFd,
+    mut on_running: impl FnMut(),
+) -> Result<u8> {
+    let mut startup = Some(startup);
     // The termination signal for which the runtime killed init.
     let mut termination_signal = None;
     loop {
-        match signals.wait()? {
+        // While init starts, signals must still reach this loop. Otherwise Ctrl-C could not end
+        // an init that hangs before exec.
+        let event = match &startup {
+            Some(pipe) => signals.wait_or_readable(pipe.as_fd())?,
+            None => Event::Signal(signals.wait()?),
+        };
+        let signal = match event {
+            Event::Signal(signal) => signal,
+            Event::Readable => {
+                let Some(pipe) = startup.take() else {
+                    continue;
+                };
+                match read_startup(init, &pipe)? {
+                    Startup::Running => on_running(),
+                    // Init is ending, and its SIGCHLD ends this loop.
+                    Startup::Failed => {}
+                    Startup::Ended(status) => {
+                        return exit_code_with_termination_signal(status, termination_signal);
+                    }
+                }
+                continue;
+            }
+        };
+        match signal {
             Signal::SIGCHLD => {
                 match waitpid(init, Some(WaitPidFlag::WNOHANG)).context("waitpid(init) failed")? {
                     WaitStatus::StillAlive => {}
@@ -263,6 +379,30 @@ fn wait_for_init(init: Pid, signals: &RuntimeSignals) -> Result<u8> {
                 }
             }
         }
+    }
+}
+
+/// What the startup pipe showed about container init.
+enum Startup {
+    /// Init executed the container program.
+    Running,
+    /// Init failed before it executed the program, and it is ending.
+    Failed,
+    /// Init ended before it executed the program, with this status.
+    Ended(WaitStatus),
+}
+
+/// Read the startup pipe of `init` after it became readable.
+fn read_startup(init: Pid, startup: &OwnedFd) -> Result<Startup> {
+    let mut byte = [0];
+    if read(startup.as_raw_fd(), &mut byte).context("read the startup pipe")? > 0 {
+        return Ok(Startup::Failed);
+    }
+    // A successful exec closes the write end. So does an init that ends before exec without
+    // writing, for example on SIGKILL. Only an init that still runs has run the program.
+    match waitpid(init, Some(WaitPidFlag::WNOHANG)).context("waitpid(init) failed")? {
+        WaitStatus::StillAlive => Ok(Startup::Running),
+        status => Ok(Startup::Ended(status)),
     }
 }
 

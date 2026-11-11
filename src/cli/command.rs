@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use super::RunArgs;
+use crate::container_id::ContainerId;
 
 /// Top-level parsed CLI command.
 #[derive(Parser, Debug)]
@@ -11,6 +12,10 @@ use super::RunArgs;
     about = "An isolated environment where AI agents can install dependencies and run experiments without root privileges"
 )]
 pub struct Cli {
+    /// Directory for container state [default: $XDG_RUNTIME_DIR/agent-jail].
+    #[arg(long, global = true, value_name = "DIR")]
+    pub root: Option<PathBuf>,
+
     /// The subcommand to dispatch (run, ...).
     #[command(subcommand)]
     pub command: Command,
@@ -26,6 +31,14 @@ pub enum Command {
         /// Path to the bundle directory that contains config.json.
         bundle: PathBuf,
     },
+    /// Print the OCI state of a container as JSON.
+    State {
+        /// Container ID.
+        #[arg(value_parser = ContainerId::parse)]
+        id: ContainerId,
+    },
+    /// List the containers that are running or that a killed run left behind.
+    List,
 }
 
 #[cfg(test)]
@@ -104,6 +117,38 @@ mod tests {
         assert_eq!(args.envs, ["A=1", "B"]);
         // Commands such as `node -e` keep their own -e.
         assert_eq!(args.args, ["-e"]);
+    }
+
+    #[test]
+    fn parses_the_container_id_and_the_state_root() {
+        let cli = Cli::try_parse_from(["aj", "run", "--root", "/state", "--id", "box", "/bin/sh"])
+            .unwrap();
+        assert_eq!(cli.root, Some(PathBuf::from("/state")));
+        let Command::Run(args) = cli.command else {
+            panic!("expected the run command");
+        };
+        assert_eq!(args.id.unwrap().as_str(), "box");
+
+        let error = Cli::try_parse_from(["aj", "run", "--id", "my+box", "/bin/sh"]).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid container ID"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn parses_state_and_list() {
+        let cli = Cli::try_parse_from(["aj", "state", "box"]).unwrap();
+        let Command::State { id } = cli.command else {
+            panic!("expected the state command");
+        };
+        assert_eq!(id.as_str(), "box");
+        assert!(Cli::try_parse_from(["aj", "state"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "state", ".."]).is_err());
+
+        let cli = Cli::try_parse_from(["aj", "--root", "/state", "list"]).unwrap();
+        assert!(matches!(cli.command, Command::List));
+        assert_eq!(cli.root, Some(PathBuf::from("/state")));
     }
 
     #[test]

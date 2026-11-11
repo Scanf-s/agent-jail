@@ -1,6 +1,7 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nix::unistd::Uid;
+use std::path::Path;
 use std::process::ExitCode;
 
 mod cgroups;
@@ -9,12 +10,15 @@ mod config;
 mod container;
 mod container_id;
 mod filesystem;
+mod flock;
 mod ipc;
 mod network;
 mod oci;
 mod paths;
+mod proc_stat;
 mod runtime;
 mod signals;
+mod state;
 mod user;
 
 #[cfg(target_os = "linux")]
@@ -27,20 +31,44 @@ fn main() -> Result<ExitCode> {
         "aj does not run as root; run it as a normal user without sudo"
     );
 
-    let mapping = user::Mapping::for_current_user()?;
+    let state_root = paths::state_root(cli.root.as_deref())?;
 
-    // A run that was killed cannot remove its own run directory, so each command removes the
-    // directories that such runs left behind.
+    match cli.command {
+        cli::Command::Run(args) => {
+            let mapping = prepare_new_container(&state_root)?;
+            runtime::Runtime::new(args.into_config()?, mapping, &state_root)?.run()
+        }
+        // Validate the whole configuration before Runtime::new creates a cgroup.
+        cli::Command::RunBundle { bundle } => {
+            let mapping = prepare_new_container(&state_root)?;
+            let config = oci::Bundle::load(&bundle)?.into_config(&mapping)?;
+            runtime::Runtime::new(config, mapping, &state_root)?.run()
+        }
+        cli::Command::State { id } => {
+            let record = state::read(&state_root, &id)?;
+            let json = serde_json::to_string_pretty(&record.oci).context("serialize the state")?;
+            println!("{json}");
+            Ok(ExitCode::SUCCESS)
+        }
+        cli::Command::List => {
+            print!("{}", state::table(&state::list(&state_root)?));
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Remove what killed runs left behind, and return the ID mapping for a new container.
+///
+/// Only commands that create a container clean up. A command that reads the state must not
+/// remove the record of a killed container before it reports that container.
+fn prepare_new_container(state_root: &Path) -> Result<user::Mapping> {
+    let mapping = user::Mapping::for_current_user()?;
+    // A killed run cannot remove its own run directory and state directory.
     if let Err(error) = filesystem::remove_stale_run_dirs(&mapping) {
         eprintln!("aj: warning: remove stale run directories: {error:#}");
     }
-
-    match cli.command {
-        cli::Command::Run(args) => runtime::Runtime::new(args.into_config()?, mapping)?.run(),
-        // Validate the whole configuration before Runtime::new creates a cgroup.
-        cli::Command::RunBundle { bundle } => {
-            let config = oci::Bundle::load(&bundle)?.into_config(&mapping)?;
-            runtime::Runtime::new(config, mapping)?.run()
-        }
+    if let Err(error) = state::remove_stale(state_root) {
+        eprintln!("aj: warning: remove stale state directories: {error:#}");
     }
+    Ok(mapping)
 }

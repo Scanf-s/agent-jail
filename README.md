@@ -54,6 +54,7 @@ Install any tools you need inside the container. They are removed when the run e
 | `--env KEY=VALUE` | Set an environment variable. Use `--env KEY` to copy a host value. |
 | `--net none` | Block outside network access. |
 | `--rootfs DIRECTORY` | Use another rootfs. |
+| `--id ID` | Name the container. See [Check containers](#check-containers). |
 
 Share the current directory:
 
@@ -77,6 +78,33 @@ Internet access is enabled by default through `pasta`. Without `pasta`, use `--n
 The container may reach host services, except those listening only on `127.0.0.1`.
 The host cannot connect to servers inside the container.
 
+## Check containers
+
+Each container has an ID. `aj run` generates a random ID, or you can choose one with `--id`.
+An ID has 1 to 128 letters, digits, `_`, `.`, and `-`, and starts with a letter or digit.
+Two containers cannot use the same ID at the same time.
+
+```bash
+aj run --id build -- /bin/sh
+```
+
+In another terminal, list the containers:
+
+```bash
+aj list
+```
+
+Print the state of one container as OCI state JSON:
+
+```bash
+aj state build
+```
+
+The state of each container is stored in `$XDG_RUNTIME_DIR/agent-jail` until its run ends.
+Use `aj --root DIRECTORY` to store it in another directory.
+If `aj` is killed, `aj list` shows its container as `stopped`.
+The next `aj run` removes what the killed run left behind.
+
 ## OCI bundles
 
 Use `aj run-bundle DIRECTORY` to run an OCI bundle without outside network access.
@@ -85,3 +113,6 @@ Only some OCI 1.3.0 settings are supported. See the [example configuration](exam
 ## Development
 
 Use `make fmt` to format the code and `make lint` to check it with Clippy.
+
+The tests in `tests/` start real containers, so `cargo test` skips them.
+On a machine that meets the requirements, run them with `cargo test -- --ignored`.
