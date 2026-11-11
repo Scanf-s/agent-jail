@@ -12,7 +12,7 @@ use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -355,6 +355,25 @@ fn passes_only_the_standard_streams_to_the_program() {
 fn reports_a_program_that_cannot_run() {
     let sandbox = Sandbox::new("no-program");
     let mut aj = sandbox.spawn_program(&["/no/such/program"]);
+
+    assert_eq!(wait(&mut aj).code(), Some(127));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+    assert_eq!(sandbox.run_dirs(), 0);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn reports_a_program_that_cannot_run_when_stderr_is_closed() {
+    let sandbox = Sandbox::new("closed-stderr");
+    // The reader of the pipe has ended, as with `aj run ... 2>&1 | head -1`.
+    let (reader, writer) = nix::unistd::pipe().unwrap();
+    drop(reader);
+
+    let mut aj = sandbox
+        .run_command(&[], &["/no/such/program"])
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .unwrap();
 
     assert_eq!(wait(&mut aj).code(), Some(127));
     assert_eq!(sandbox.states(), Vec::<Value>::new());

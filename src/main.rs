@@ -4,6 +4,9 @@ use nix::unistd::Uid;
 use std::path::Path;
 use std::process::ExitCode;
 
+#[macro_use]
+mod report;
+
 mod cgroups;
 mod cli;
 mod config;
@@ -65,10 +68,10 @@ fn prepare_new_container(state_root: &Path) -> Result<user::Mapping> {
     let mapping = user::Mapping::for_current_user()?;
     // A killed run cannot remove its own run directory and state directory.
     if let Err(error) = filesystem::remove_stale_run_dirs(&mapping) {
-        eprintln!("aj: warning: remove stale run directories: {error:#}");
+        report!("aj: warning: remove stale run directories: {error:#}");
     }
     if let Err(error) = state::remove_stale(state_root) {
-        eprintln!("aj: warning: remove stale state directories: {error:#}");
+        report!("aj: warning: remove stale state directories: {error:#}");
     }
     Ok(mapping)
 }

@@ -41,14 +41,14 @@ pub fn list(root: &Path) -> Result<Vec<Record>> {
             Ok(true) if is_id => {}
             Ok(_) => continue,
             Err(error) => {
-                eprintln!("aj: warning: read {dir:?}: {error}");
+                report!("aj: warning: read {dir:?}: {error}");
                 continue;
             }
         }
         match Record::load(&dir).and_then(|record| with_current_status(&dir, record)) {
             Ok(record) => records.push(record),
             Err(error) if is_not_found(&error) => {}
-            Err(error) => eprintln!("aj: warning: {error:#}"),
+            Err(error) => report!("aj: warning: {error:#}"),
         }
     }
     records.sort_by(|a, b| (a.created, a.oci.id()).cmp(&(b.created, b.oci.id())));

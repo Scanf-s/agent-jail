@@ -77,18 +77,18 @@ impl Runtime {
         let ended = self.cgroup.kill_all();
         // The setup process removes the run directory. This covers a run that fails before that.
         if let Err(error) = self.run_dir.remove() {
-            eprintln!("aj: warning: {error:#}");
+            report!("aj: warning: {error:#}");
         }
         match ended {
             Ok(()) => {
                 if let Err(error) = self.state_dir.remove() {
-                    eprintln!("aj: warning: {error:#}");
+                    report!("aj: warning: {error:#}");
                 }
             }
             // The state keeps the container visible in `aj list` and its ID in use while its
             // processes may still run.
             Err(error) => {
-                eprintln!(
+                report!(
                     "aj: warning: end the processes left in the container, so its state stays: \
                      {error:#}"
                 );
@@ -142,7 +142,7 @@ impl Runtime {
 
     fn run_setup_process(&mut self, signals: &RuntimeSignals) -> ! {
         if let Err(error) = self.setup_process(signals) {
-            eprintln!("aj: setup process failed: {error:#}");
+            report!("aj: setup process failed: {error:#}");
             std::process::exit(127);
         }
         unreachable!("setup process returned without exiting");
@@ -188,14 +188,14 @@ impl Runtime {
                 // Only a process in the user namespace can remove files of subordinate IDs.
                 // The overlay is already gone, because init's mount namespace ended with it.
                 if let Err(error) = self.run_dir.remove() {
-                    eprintln!("aj: warning: {error:#}");
+                    report!("aj: warning: {error:#}");
                 }
                 std::process::exit(i32::from(code?));
             }
             ForkResult::Child => {
                 drop(startup_reader);
                 if let Err(error) = self.run_init() {
-                    eprintln!("aj: container init failed: {error:#}");
+                    report!("aj: container init failed: {error:#}");
                     let _ = write(&startup_writer, &[1]);
                     std::process::exit(127);
                 }
@@ -216,7 +216,7 @@ impl Runtime {
             })
         })();
         if let Err(error) = result {
-            eprintln!("aj: warning: record that the container runs: {error:#}");
+            report!("aj: warning: record that the container runs: {error:#}");
         }
     }
 
@@ -227,7 +227,7 @@ impl Runtime {
             record.exit_code = exit_code;
         });
         if let Err(error) = result {
-            eprintln!("aj: warning: record that the container stopped: {error:#}");
+            report!("aj: warning: record that the container stopped: {error:#}");
         }
     }
 
@@ -279,7 +279,7 @@ fn wait_for_setup_process(child: Pid, signals: &RuntimeSignals) -> Result<WaitSt
             Ok(signal) => signal,
             // Returning early would remove the run directory while the container still uses it.
             Err(error) => {
-                eprintln!("aj: warning: {error:#}");
+                report!("aj: warning: {error:#}");
                 return waitpid(child, None).context("waitpid failed");
             }
         };
@@ -364,7 +364,7 @@ fn wait_for_init(
                     // Passing the signal on leaves the decision to the program, as if it had
                     // a handler.
                     Err(error) => {
-                        eprintln!("aj: warning: pass {signal} on to the container: {error:#}");
+                        report!("aj: warning: pass {signal} on to the container: {error:#}");
                         false
                     }
                 };
