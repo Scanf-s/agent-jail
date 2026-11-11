@@ -14,6 +14,7 @@ mod ipc;
 mod network;
 mod oci;
 mod paths;
+mod proc_stat;
 mod runtime;
 mod signals;
 mod state;

@@ -1,7 +1,11 @@
 use anyhow::{Context, Result};
+use nix::errno::Errno;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::signal::{SigHandler, SigSet, SigmaskHow, Signal, signal, sigprocmask};
+use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::unistd::Pid;
 use std::fs;
+use std::os::fd::{AsFd, BorrowedFd};
 
 /// Signals that a terminal, a process manager, or a user sends to end a program.
 const TERMINATION_SIGNALS: [Signal; 4] = [
@@ -37,6 +41,42 @@ impl RuntimeSignals {
     pub fn wait(&self) -> Result<Signal> {
         self.set.wait().context("wait for a signal")
     }
+
+    /// Wait until one of the blocked signals arrives, or `fd` has data or reaches its end.
+    pub fn wait_or_readable(&self, fd: BorrowedFd) -> Result<Event> {
+        // A signalfd also reports the signals that were pending before it was created.
+        let signal_fd =
+            SignalFd::with_flags(&self.set, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
+                .context("create a signalfd")?;
+        loop {
+            let mut fds = [
+                PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN),
+                PollFd::new(fd, PollFlags::POLLIN),
+            ];
+            match poll(&mut fds, PollTimeout::NONE) {
+                Err(Errno::EINTR) => continue,
+                result => result.context("poll")?,
+            };
+            // A closed write end shows as POLLHUP instead of POLLIN.
+            let [signal_ready, fd_ready] =
+                fds.map(|fd| fd.revents().is_some_and(|events| !events.is_empty()));
+            if signal_ready && let Some(info) = signal_fd.read_signal().context("read a signal")? {
+                let signal = Signal::try_from(info.ssi_signo as i32).context("read a signal")?;
+                return Ok(Event::Signal(signal));
+            }
+            if fd_ready {
+                return Ok(Event::Readable);
+            }
+        }
+    }
+}
+
+/// What `RuntimeSignals::wait_or_readable` waited for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Event {
+    Signal(Signal),
+    /// The file has data, or its write end was closed.
+    Readable,
 }
 
 /// Give the program the signal state that a new process normally has.
@@ -96,6 +136,26 @@ mod tests {
         let catches_int = status("0000000000000000", "0000000000000002");
         assert!(!uses_default_action_in(&catches_int, Signal::SIGINT).unwrap());
         assert!(uses_default_action_in(&catches_int, Signal::SIGTERM).unwrap());
+    }
+
+    // The signal mask belongs to a thread, so blocking signals here does not change other tests.
+    #[test]
+    fn waits_for_a_closed_write_end_or_a_signal() {
+        let signals = RuntimeSignals::block().unwrap();
+        let (reader, writer) = nix::unistd::pipe().unwrap();
+
+        // raise sends the signal to this thread, which blocks it, so it stays pending.
+        nix::sys::signal::raise(Signal::SIGTERM).unwrap();
+        assert_eq!(
+            signals.wait_or_readable(reader.as_fd()).unwrap(),
+            Event::Signal(Signal::SIGTERM)
+        );
+
+        drop(writer);
+        assert_eq!(
+            signals.wait_or_readable(reader.as_fd()).unwrap(),
+            Event::Readable
+        );
     }
 
     #[test]

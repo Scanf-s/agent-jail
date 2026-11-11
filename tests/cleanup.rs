@@ -35,6 +35,11 @@ impl Sandbox {
 
     /// Start `aj run` with `script` in its own process group, as a shell does for a job.
     fn spawn(&self, script: &str) -> Child {
+        self.spawn_program(&["/bin/sh", "-c", script])
+    }
+
+    /// Start `aj run` with `program` and its arguments, as `spawn` does.
+    fn spawn_program(&self, program: &[&str]) -> Child {
         let mut command = Command::new(env!("CARGO_BIN_EXE_aj"));
         command
             .env("XDG_DATA_HOME", self.root.join("data"))
@@ -47,7 +52,8 @@ impl Sandbox {
             .arg(rootfs())
             .arg("-v")
             .arg(format!("{}:/out", self.root.join("out").display()))
-            .args(["--", "/bin/sh", "-c", script])
+            .arg("--")
+            .args(program)
             .process_group(0);
         // A shell without job control starts background jobs with SIGINT and SIGQUIT ignored.
         // The tests need the default actions that a terminal job has.
@@ -153,16 +159,31 @@ fn records_the_state_while_the_container_runs() {
     let mut aj = sandbox.spawn("touch /out/ready && while [ ! -e /out/stop ]; do sleep 0.1; done");
     sandbox.wait_until_ready();
 
+    let init = only_child(only_child(Pid::from_raw(aj.id() as i32)));
+
     let states = sandbox.states();
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["ociVersion"], "1.3.0");
-    assert_eq!(states[0]["status"], "creating");
+    assert_eq!(states[0]["status"], "running");
+    assert_eq!(states[0]["pid"], init.as_raw());
+    assert!(states[0]["initStartTime"].as_u64().unwrap() > 0);
     assert_eq!(states[0]["bundle"], rootfs().to_str().unwrap());
     assert_eq!(states[0]["autoDelete"], true);
 
     fs::write(sandbox.root.join("out/stop"), "").unwrap();
     assert_eq!(wait(&mut aj).code(), Some(0));
     assert_eq!(sandbox.states(), Vec::<Value>::new());
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn reports_a_program_that_cannot_run() {
+    let sandbox = Sandbox::new("no-program");
+    let mut aj = sandbox.spawn_program(&["/no/such/program"]);
+
+    assert_eq!(wait(&mut aj).code(), Some(127));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+    assert_eq!(sandbox.run_dirs(), 0);
 }
 
 #[test]

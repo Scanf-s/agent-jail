@@ -17,6 +17,8 @@ const TEMPORARY_FILE: &str = "state.json.tmp";
 /// container init end with exit or exec.
 pub struct StateDir {
     path: PathBuf,
+    /// What the state file holds now.
+    record: Record,
     // An exclusive flock shows that a runtime process of the container is alive, as for the
     // run directory. The forked processes share this open file, and the kernel releases the
     // lock when the last of them ends, even when they are killed.
@@ -25,7 +27,7 @@ pub struct StateDir {
 
 impl StateDir {
     /// Create the state directory of container `id` under `root`, and write `record` to it.
-    pub fn create(root: &Path, id: &ContainerId, record: &Record) -> Result<Self> {
+    pub fn create(root: &Path, id: &ContainerId, record: Record) -> Result<Self> {
         // The directory holds paths of the user's files, so only the user may read it.
         DirBuilder::new()
             .recursive(true)
@@ -48,17 +50,28 @@ impl StateDir {
             .with_context(|| format!("lock {path:?}"))?
             .with_context(|| format!("another process holds the lock of {path:?}"))?;
 
-        let dir = Self { path, _lock: lock };
-        dir.write(record)?;
+        let dir = Self {
+            path,
+            record,
+            _lock: lock,
+        };
+        dir.write()?;
         Ok(dir)
     }
 
-    /// Replace the state file with `record`.
+    /// Apply `change` to the record and write it to the state file.
+    pub fn update(&mut self, change: impl FnOnce(&mut Record)) -> Result<()> {
+        change(&mut self.record);
+        self.write()
+    }
+
+    /// Replace the state file with the record.
     ///
     /// The new content goes to a temporary file first. rename replaces the state file at once,
     /// so a reader sees either the old or the new record, never a part of one.
-    pub fn write(&self, record: &Record) -> Result<()> {
-        let json = serde_json::to_vec_pretty(record).context("serialize the container state")?;
+    fn write(&self) -> Result<()> {
+        let json =
+            serde_json::to_vec_pretty(&self.record).context("serialize the container state")?;
         let temporary = self.path.join(TEMPORARY_FILE);
         fs::write(&temporary, json).with_context(|| format!("write {temporary:?}"))?;
         let state = self.path.join(STATE_FILE);
@@ -115,17 +128,20 @@ mod tests {
     }
 
     #[test]
-    fn writes_the_record_and_replaces_it() {
+    fn writes_the_record_and_each_change() {
         let root = TempRoot::new();
         let id = ContainerId::parse("box1").unwrap();
-        let mut record = record(&id);
+        let mut expected = record(&id);
 
-        let dir = StateDir::create(&root.0, &id, &record).unwrap();
-        assert_eq!(read(&dir.path), record);
+        let mut dir = StateDir::create(&root.0, &id, expected.clone()).unwrap();
+        assert_eq!(read(&dir.path), expected);
 
-        record.oci.set_status(ContainerState::Running);
-        dir.write(&record).unwrap();
-        assert_eq!(read(&dir.path), record);
+        dir.update(|record| {
+            record.oci.set_status(ContainerState::Running);
+        })
+        .unwrap();
+        expected.oci.set_status(ContainerState::Running);
+        assert_eq!(read(&dir.path), expected);
         assert!(!dir.path.join(TEMPORARY_FILE).exists());
     }
 
@@ -133,9 +149,9 @@ mod tests {
     fn rejects_an_id_that_is_in_use() {
         let root = TempRoot::new();
         let id = ContainerId::parse("box1").unwrap();
-        let first = StateDir::create(&root.0, &id, &record(&id)).unwrap();
+        let first = StateDir::create(&root.0, &id, record(&id)).unwrap();
 
-        let error = StateDir::create(&root.0, &id, &record(&id)).err().unwrap();
+        let error = StateDir::create(&root.0, &id, record(&id)).err().unwrap();
 
         assert!(error.to_string().contains("already exists"), "{error:#}");
         assert_eq!(read(&first.path).oci.id(), "box1");
@@ -145,7 +161,7 @@ mod tests {
     fn holds_the_lock_and_removes_the_directory_when_dropped() {
         let root = TempRoot::new();
         let id = ContainerId::parse("box1").unwrap();
-        let dir = StateDir::create(&root.0, &id, &record(&id)).unwrap();
+        let dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
         let path = dir.path.clone();
 
         let probe = try_lock(File::open(&path).unwrap(), LockKind::Shared).unwrap();
@@ -164,7 +180,7 @@ mod tests {
         let root = TempRoot::new();
         let id = ContainerId::parse("box1").unwrap();
 
-        let _dir = StateDir::create(&root.0, &id, &record(&id)).unwrap();
+        let _dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
 
         let mode = fs::metadata(&root.0).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
