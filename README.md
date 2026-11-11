@@ -100,15 +100,30 @@ Print the state of one container as OCI state JSON:
 aj state build
 ```
 
-The state of each container is stored in `$XDG_RUNTIME_DIR/agent-jail` until its run ends.
+The state of each container is stored in `$XDG_RUNTIME_DIR/agent-jail`. `aj run` removes it when the program ends.
 Use `aj --root DIRECTORY` to store it in another directory.
-If `aj` is killed, `aj list` shows its container as `stopped`.
-The next `aj run` removes what the killed run left behind.
+If `aj` is killed, its container ends too, and `aj list` shows it as `stopped`.
+A program that changes its user, for example with `su`, can keep running.
+The next `aj run` or `aj create` ends such a program and removes what the killed run left behind.
 
 ## OCI bundles
 
 Use `aj run-bundle DIRECTORY` to run an OCI bundle without outside network access.
 Only some OCI 1.3.0 settings are supported. See the [example configuration](examples/oci-bundle/config.json).
+
+As other OCI runtimes do, `aj` can also create the container first and start its program later:
+
+```bash
+aj create --bundle DIRECTORY build
+aj start build
+```
+
+`aj create` returns when the container is ready. Without `--bundle`, it uses the current directory.
+The program receives the standard input and output of `aj create`, but it runs only after `aj start`.
+After the program ends, the container stays as `stopped` and keeps its ID.
+`aj` cannot delete such a container yet.
+
+When you log out, systemd ends these containers, unless lingering is enabled for your user (`loginctl enable-linger`).
 
 ## Development
 
