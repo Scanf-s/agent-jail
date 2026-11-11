@@ -1,6 +1,6 @@
+use crate::container_id::ContainerId;
 use crate::paths;
 use anyhow::{Context, Result};
-use rand::random;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,14 +13,14 @@ pub struct RunDir {
 }
 
 impl RunDir {
-    /// Create a new run directory under `$XDG_DATA_HOME/agent-jail/runs`.
-    pub fn create() -> Result<Self> {
-        Self::create_in(&paths::data_dir()?.join("runs"))
+    /// Create the run directory of container `id` under `$XDG_DATA_HOME/agent-jail/runs`.
+    pub fn create(id: &ContainerId) -> Result<Self> {
+        Self::create_in(&paths::data_dir()?.join("runs"), id)
     }
 
-    fn create_in(runs: &Path) -> Result<Self> {
+    fn create_in(runs: &Path, id: &ContainerId) -> Result<Self> {
         fs::create_dir_all(runs).with_context(|| format!("create {runs:?}"))?;
-        let path = runs.join(format!("{:x}", random::<u64>()));
+        let path = runs.join(id.as_str());
         fs::create_dir(&path).with_context(|| format!("create {path:?}"))?;
         let run_dir = Self { path };
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
@@ -61,11 +61,12 @@ impl RunDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::random;
 
     #[test]
     fn creates_and_removes_the_overlay_directories() {
         let runs = std::env::temp_dir().join(format!("agent-jail-runs-{:x}", random::<u64>()));
-        let run_dir = RunDir::create_in(&runs).unwrap();
+        let run_dir = RunDir::create_in(&runs, &ContainerId::generate()).unwrap();
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             assert!(dir.is_dir(), "{dir:?} is missing");
         }

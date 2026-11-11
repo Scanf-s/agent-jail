@@ -7,6 +7,7 @@ mod cgroups;
 mod cli;
 mod config;
 mod container;
+mod container_id;
 mod filesystem;
 mod ipc;
 mod network;

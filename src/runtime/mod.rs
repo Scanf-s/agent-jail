@@ -23,10 +23,10 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(config: ContainerConfig, mapping: Mapping) -> Result<Self> {
         // This may replace the process, so it runs before the runtime opens any resource.
-        let delegated = cgroups::enter_delegated_cgroup()?;
-        let cgroup = Cgroup::new(&delegated)?;
+        let (delegated, id) = cgroups::enter_delegated_cgroup()?;
+        let cgroup = Cgroup::new(&delegated, &id)?;
         cgroup.configure(&config.resources)?;
-        let run_dir = RunDir::create()?;
+        let run_dir = RunDir::create(&id)?;
 
         // ipc setup for the parent and the child process communication
         let channels = StartupChannels::new()?;

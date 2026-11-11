@@ -1,6 +1,6 @@
+use crate::container_id::ContainerId;
 use anyhow::{Context, Result, bail};
 use nix::unistd::{AccessFlags, Pid, access};
-use rand::random;
 use std::fs;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -86,11 +86,11 @@ pub struct Cgroup {
 
 impl Cgroup {
     /// Create the container cgroup inside `delegated`, the cgroup that the runtime runs in.
-    pub fn new(delegated: &Path) -> Result<Self> {
-        Self::create_in(delegated, Pid::this())
+    pub fn new(delegated: &Path, id: &ContainerId) -> Result<Self> {
+        Self::create_in(delegated, Pid::this(), id)
     }
 
-    fn create_in(delegated: &Path, runtime: Pid) -> Result<Self> {
+    fn create_in(delegated: &Path, runtime: Pid, id: &ContainerId) -> Result<Self> {
         check_delegated(delegated, runtime)?;
 
         let leaf = delegated.join(RUNTIME_LEAF);
@@ -104,12 +104,11 @@ impl Cgroup {
         )
         .with_context(|| format!("enable controllers in {delegated:?}"))?;
 
-        Self::create_cgroup_dir(delegated)
+        Self::create_cgroup_dir(delegated, id)
     }
 
-    fn create_cgroup_dir(parent: &Path) -> Result<Self> {
-        let id = format!("jail_{:x}", random::<u64>());
-        let path = parent.join(&id);
+    fn create_cgroup_dir(parent: &Path, id: &ContainerId) -> Result<Self> {
+        let path = parent.join(format!("jail_{id}"));
         fs::create_dir(&path).context("create cgroup dir")?;
         // From here on, Drop removes the directory if a later check fails.
         let cgroup = Cgroup { path };
@@ -175,6 +174,7 @@ impl Drop for Cgroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::random;
     use std::os::unix::fs::PermissionsExt;
 
     struct TempDir(PathBuf);
@@ -272,7 +272,9 @@ mod tests {
         let temp = delegated_dir(runtime);
 
         // A plain directory has no cgroup.controllers in the new child, so creation stops there.
-        let error = Cgroup::create_in(&temp.0, runtime).err().unwrap();
+        let error = Cgroup::create_in(&temp.0, runtime, &ContainerId::generate())
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("read new cgroup.controllers"));
 
         let leaf = temp.0.join(RUNTIME_LEAF);
@@ -290,7 +292,9 @@ mod tests {
     fn removes_new_cgroup_when_controller_read_fails() {
         // Unlike cgroupfs, a normal directory has no cgroup.controllers file.
         let temp = TempDir::new();
-        let error = Cgroup::create_cgroup_dir(&temp.0).err().unwrap();
+        let error = Cgroup::create_cgroup_dir(&temp.0, &ContainerId::generate())
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("read new cgroup.controllers"));
 
         // The new cgroup directory should be removed when setup fails.
