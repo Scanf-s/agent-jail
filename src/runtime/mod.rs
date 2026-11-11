@@ -9,19 +9,19 @@ use crate::signals::{self, Event, RuntimeSignals};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail, ensure};
-use nix::fcntl::OFlag;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{
-    ForkResult, Gid, Pid, Uid, chdir, fork, pipe2, read, setgid, setgroups, setuid, write,
-};
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setgroups, setuid};
 use oci_spec::runtime::ContainerState;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use startup::Report;
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
+
+mod startup;
 
 pub struct Runtime {
     config: ContainerConfig,
@@ -175,16 +175,13 @@ impl Runtime {
     }
 
     fn launch_init(&mut self, signals: &RuntimeSignals) -> Result<()> {
-        // Container init writes a byte to this pipe if it fails before the program runs. The
-        // write end has O_CLOEXEC, so a successful exec closes it, and the setup process reads
-        // EOF instead.
-        let (startup_reader, startup_writer) =
-            pipe2(OFlag::O_CLOEXEC).context("create the startup pipe")?;
+        let (channel, mut init_channel) = startup::channel()?;
         match unsafe { fork() }.context("fork (setup) failed")? {
             ForkResult::Parent { child } => {
-                drop(startup_writer);
-                let code = supervise(child, signals, startup_reader, || {
-                    self.record_running(child);
+                drop(init_channel);
+                let code = supervise(child, signals, channel, |report| match report {
+                    Report::Closed => self.record_running(child),
+                    Report::Failed(message) => report!("aj: container init failed: {message}"),
                 });
                 self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
@@ -195,10 +192,10 @@ impl Runtime {
                 std::process::exit(i32::from(code?));
             }
             ForkResult::Child => {
-                drop(startup_reader);
-                if let Err(error) = self.run_init(&startup_writer) {
-                    report!("aj: container init failed: {error:#}");
-                    let _ = write(&startup_writer, &[1]);
+                drop(channel);
+                if let Err(error) = self.run_init(&init_channel) {
+                    // The setup process prints the error.
+                    let _ = startup::send_failure(&mut init_channel, &error);
                     std::process::exit(127);
                 }
                 unreachable!("container init returned without executing command");
@@ -233,9 +230,9 @@ impl Runtime {
         }
     }
 
-    /// Prepare the container and execute its program. `startup` is the write end of the startup
-    /// pipe.
-    fn run_init(&self, startup: &OwnedFd) -> Result<()> {
+    /// Prepare the container and execute its program. `startup` is the end of the startup
+    /// channel that init keeps.
+    fn run_init(&self, startup: &UnixStream) -> Result<()> {
         // The setup of the container can take a while, for example to mount the overlay.
         end_with_monitor(startup)?;
         match self.config.network {
@@ -282,16 +279,14 @@ impl Runtime {
 /// without it. The program can still clear the setting, for example by changing its user. The
 /// cleanup of a later run ends such a container.
 ///
-/// The setup process holds the only read end of the startup pipe `startup`. If it ended before
-/// the setting took effect, the read end is closed, and this fails.
-fn end_with_monitor(startup: &OwnedFd) -> Result<()> {
+/// The setup process holds the other end of the startup channel `startup`. If it ended before
+/// the setting took effect, that end is closed, and this fails.
+fn end_with_monitor(startup: &UnixStream) -> Result<()> {
     set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")?;
-    let mut fds = [PollFd::new(startup.as_fd(), PollFlags::empty())];
-    poll(&mut fds, PollTimeout::ZERO).context("poll the startup pipe")?;
-    let reader_closed = fds[0]
-        .revents()
-        .is_some_and(|events| events.intersects(PollFlags::POLLERR | PollFlags::POLLHUP));
-    ensure!(!reader_closed, "the setup process has ended");
+    ensure!(
+        !startup::peer_closed(startup)?,
+        "the setup process has ended"
+    );
     Ok(())
 }
 
@@ -327,17 +322,17 @@ fn wait_for_setup_process(child: Pid, signals: &RuntimeSignals) -> Result<WaitSt
 
 /// Wait until container init ends, and return the exit code for the runtime.
 ///
-/// `startup` is the read end of the startup pipe. When it shows that init runs the container
-/// program, this calls `on_running`.
+/// `channel` is the end of the startup channel that the setup process keeps. This passes what
+/// init reports through it to `on_report`.
 ///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
 fn supervise(
     init: Pid,
     signals: &RuntimeSignals,
-    startup: OwnedFd,
-    on_running: impl FnMut(),
+    channel: UnixStream,
+    on_report: impl FnMut(Report),
 ) -> Result<u8> {
-    let result = wait_for_init(init, signals, startup, on_running);
+    let result = wait_for_init(init, signals, channel, on_report);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -348,42 +343,40 @@ fn supervise(
 fn wait_for_init(
     init: Pid,
     signals: &RuntimeSignals,
-    startup: OwnedFd,
-    mut on_running: impl FnMut(),
+    channel: UnixStream,
+    mut on_report: impl FnMut(Report),
 ) -> Result<u8> {
-    let mut startup = Some(startup);
+    let mut channel = Some(channel);
     // The termination signal for which the runtime killed init.
     let mut termination_signal = None;
     loop {
         // While init starts, signals must still reach this loop. Otherwise Ctrl-C could not end
         // an init that hangs before exec.
-        let event = match &startup {
-            Some(pipe) => signals.wait_or_readable(pipe.as_fd())?,
+        let event = match &channel {
+            Some(channel) => signals.wait_or_readable(channel.as_fd())?,
             None => Event::Signal(signals.wait()?),
         };
         let signal = match event {
             Event::Signal(signal) => signal,
             Event::Readable => {
-                let Some(pipe) = startup.take() else {
-                    continue;
-                };
-                match read_startup(init, &pipe)? {
-                    Startup::Running => on_running(),
-                    // Init is ending, and its SIGCHLD ends this loop.
-                    Startup::Failed => {}
-                    Startup::Ended(status) => {
-                        return exit_code_with_termination_signal(status, termination_signal);
-                    }
+                if let Some(mut open) = channel.take() {
+                    on_report(startup::read_report(&mut open)?);
                 }
                 continue;
             }
         };
         match signal {
             Signal::SIGCHLD => {
-                match waitpid(init, Some(WaitPidFlag::WNOHANG)).context("waitpid(init) failed")? {
-                    WaitStatus::StillAlive => {}
-                    status => return exit_code_with_termination_signal(status, termination_signal),
+                if !has_ended(init)? {
+                    continue;
                 }
+                // Init can report and end before this loop reads the report. Its end of the
+                // channel closed when it ended, so this read does not block.
+                if let Some(mut open) = channel.take() {
+                    on_report(startup::read_report(&mut open)?);
+                }
+                let status = waitpid(init, None).context("waitpid(init) failed")?;
+                return exit_code_with_termination_signal(status, termination_signal);
             }
             signal => {
                 let default_action = match signals::uses_default_action(init, signal) {
@@ -409,28 +402,12 @@ fn wait_for_init(
     }
 }
 
-/// What the startup pipe showed about container init.
-enum Startup {
-    /// Init executed the container program.
-    Running,
-    /// Init failed before it executed the program, and it is ending.
-    Failed,
-    /// Init ended before it executed the program, with this status.
-    Ended(WaitStatus),
-}
-
-/// Read the startup pipe of `init` after it became readable.
-fn read_startup(init: Pid, startup: &OwnedFd) -> Result<Startup> {
-    let mut byte = [0];
-    if read(startup.as_raw_fd(), &mut byte).context("read the startup pipe")? > 0 {
-        return Ok(Startup::Failed);
-    }
-    // A successful exec closes the write end. So does an init that ends before exec without
-    // writing, for example on SIGKILL. Only an init that still runs has run the program.
-    match waitpid(init, Some(WaitPidFlag::WNOHANG)).context("waitpid(init) failed")? {
-        WaitStatus::StillAlive => Ok(Startup::Running),
-        status => Ok(Startup::Ended(status)),
-    }
+/// Whether `init` has ended. This does not reap it, so its exit status and its `/proc` entry
+/// stay.
+fn has_ended(init: Pid) -> Result<bool> {
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    let status = waitid(Id::Pid(init), flags).context("waitid(init) failed")?;
+    Ok(status != WaitStatus::StillAlive)
 }
 
 /// Like `exit_status`, but if the runtime killed init for a termination signal, the code shows

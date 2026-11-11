@@ -39,11 +39,6 @@ impl Sandbox {
         self.spawn_with(&[], &["/bin/sh", "-c", script])
     }
 
-    /// Start `aj run` with `program` and its arguments, as `spawn` does.
-    fn spawn_program(&self, program: &[&str]) -> Child {
-        self.spawn_with(&[], program)
-    }
-
     /// Start `aj run` with the options `run_args`, `program`, and its arguments.
     fn spawn_with(&self, run_args: &[&str], program: &[&str]) -> Child {
         self.run_command(run_args, program).spawn().unwrap()
@@ -362,9 +357,15 @@ fn passes_only_the_standard_streams_to_the_program() {
 #[ignore = "starts a container"]
 fn reports_a_program_that_cannot_run() {
     let sandbox = Sandbox::new("no-program");
-    let mut aj = sandbox.spawn_program(&["/no/such/program"]);
 
-    assert_eq!(wait(&mut aj).code(), Some(127));
+    let output = sandbox.run_output(&[], &["/no/such/program"]);
+
+    assert_eq!(output.status.code(), Some(127));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(r#"container init failed: exec "/no/such/program""#),
+        "{stderr}"
+    );
     assert_eq!(sandbox.states(), Vec::<Value>::new());
     assert_eq!(sandbox.run_dirs(), 0);
 }
