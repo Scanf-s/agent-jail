@@ -34,10 +34,11 @@ pub struct StateDir {
 impl StateDir {
     /// Create the state directory of container `id` under `root`, and write `record` to it.
     pub fn create(root: &Path, id: &ContainerId, record: Record) -> Result<Self> {
-        // The directory holds paths of the user's files, so only the user may read it.
-        DirBuilder::new()
+        // A state file holds paths of the user's files, so only the user may read it. A root
+        // that already exists, for example one that --root names, keeps its permissions, so
+        // each state directory below it is private, too.
+        private_dir()
             .recursive(true)
-            .mode(0o700)
             .create(root)
             .with_context(|| format!("create {root:?}"))?;
         // The cleanup of stale state directories locks `root` exclusively. While this shared
@@ -48,7 +49,9 @@ impl StateDir {
         // The directory gets the name of the ID only after it has its lock and its state file,
         // so a reader never finds it without them. No ID starts with '.'.
         let temporary = root.join(format!(".creating-{:016x}", random::<u64>()));
-        fs::create_dir(&temporary).with_context(|| format!("create {temporary:?}"))?;
+        private_dir()
+            .create(&temporary)
+            .with_context(|| format!("create {temporary:?}"))?;
         let lock = match lock_new_dir(&temporary) {
             Ok(lock) => lock,
             Err(error) => {
@@ -129,6 +132,12 @@ impl Drop for StateDir {
             let _ = self.remove();
         }
     }
+}
+
+fn private_dir() -> DirBuilder {
+    let mut builder = DirBuilder::new();
+    builder.mode(0o700);
+    builder
 }
 
 fn open(path: &Path) -> Result<File> {
@@ -269,14 +278,30 @@ mod tests {
     }
 
     #[test]
-    fn creates_the_root_for_the_user_only() {
+    fn creates_directories_for_the_user_only() {
         use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         let root = TempRoot::new();
         let id = ContainerId::parse("box1").unwrap();
 
-        let _dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
+        let dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
 
-        let mode = fs::metadata(&root.0).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(mode(&root.0), 0o700);
+        assert_eq!(mode(&dir.path), 0o700);
+    }
+
+    #[test]
+    fn keeps_the_permissions_of_an_existing_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = TempRoot::new();
+        fs::create_dir(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let id = ContainerId::parse("box1").unwrap();
+
+        let dir = StateDir::create(&root.0, &id, record(&id)).unwrap();
+
+        assert_eq!(mode(&root.0), 0o755);
+        assert_eq!(mode(&dir.path), 0o700);
     }
 }
