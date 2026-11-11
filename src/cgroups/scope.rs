@@ -2,6 +2,7 @@ use super::cgroup::{check_delegated, own_cgroup};
 use crate::container_id::ContainerId;
 use anyhow::{Context, Result, bail};
 use nix::unistd::Pid;
+use rand::random;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -54,19 +55,31 @@ fn choose_id(
     }
 }
 
-/// The name of the scope unit for container `id`.
+/// A new name for a scope unit of container `id`: `agent-jail-<id>-<8 hex digits>.scope`.
+///
+/// systemd keeps a unit for a short time after its processes end. A name made from the ID
+/// alone would make a run fail when it uses the ID of a run that just ended. The state
+/// directory, not the unit name, keeps two containers from using the same ID.
 fn unit_name(id: &ContainerId) -> String {
-    format!("{SCOPE_PREFIX}{id}{SCOPE_SUFFIX}")
+    format!("{SCOPE_PREFIX}{id}-{:08x}{SCOPE_SUFFIX}", random::<u32>())
 }
 
 /// The container ID in the name of a scope that the runtime created.
 fn container_id_of_scope(cgroup: &Path) -> Option<ContainerId> {
     let name = cgroup.file_name()?.to_str()?;
-    ContainerId::parse(
-        name.strip_prefix(SCOPE_PREFIX)?
-            .strip_suffix(SCOPE_SUFFIX)?,
-    )
-    .ok()
+    let name = name
+        .strip_prefix(SCOPE_PREFIX)?
+        .strip_suffix(SCOPE_SUFFIX)?;
+    // An ID can contain '-', but the random part after the last '-' cannot.
+    let (id, random_part) = name.rsplit_once('-')?;
+    let is_random_part = random_part.len() == 8
+        && random_part
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !is_random_part {
+        return None;
+    }
+    ContainerId::parse(id).ok()
 }
 
 /// Build a command that runs `exe` with `args` in a new scope named `unit`.
@@ -91,13 +104,20 @@ mod tests {
 
     #[test]
     fn names_a_scope_unit_for_any_valid_id() {
-        for id in ["0123456789abcdef", "web.service", "box"] {
+        for id in ["0123456789abcdef", "web.service", "box", "my-box-2"] {
             let id = ContainerId::parse(id).unwrap();
             let unit = unit_name(&id);
-            assert_eq!(unit, format!("agent-jail-{id}.scope"));
+            assert!(unit.starts_with(&format!("agent-jail-{id}-")), "{unit}");
+            assert!(unit.ends_with(".scope"), "{unit}");
             let cgroup = Path::new("/sys/fs/cgroup/app.slice").join(&unit);
             assert_eq!(container_id_of_scope(&cgroup), Some(id));
         }
+    }
+
+    #[test]
+    fn names_each_scope_of_one_id_differently() {
+        let id = ContainerId::parse("box").unwrap();
+        assert_ne!(unit_name(&id), unit_name(&id));
     }
 
     #[test]
@@ -124,9 +144,12 @@ mod tests {
         for other in [
             "/sys/fs/cgroup/init.scope",
             "/sys/fs/cgroup/app.slice/run-1a2b.scope",
-            "/sys/fs/cgroup/app.slice/agent-jail-1a2b.service",
-            "/sys/fs/cgroup/app.slice/agent-jail-..scope",
-            "/sys/fs/cgroup/app.slice/agent-jail-.scope",
+            "/sys/fs/cgroup/app.slice/agent-jail-1a2b-0123abcd.service",
+            "/sys/fs/cgroup/app.slice/agent-jail-1a2b.scope",
+            "/sys/fs/cgroup/app.slice/agent-jail-1a2b-0123ABCD.scope",
+            "/sys/fs/cgroup/app.slice/agent-jail-1a2b-0123abc.scope",
+            "/sys/fs/cgroup/app.slice/agent-jail-..-0123abcd.scope",
+            "/sys/fs/cgroup/app.slice/agent-jail--0123abcd.scope",
         ] {
             assert_eq!(container_id_of_scope(Path::new(other)), None, "{other}");
         }

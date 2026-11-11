@@ -259,6 +259,17 @@ fn rejects_an_id_that_a_container_uses() {
 
 #[test]
 #[ignore = "starts a container"]
+fn runs_the_same_id_again_right_after_it_ends() {
+    let sandbox = Sandbox::new("same-id-again");
+    // systemd keeps the scope of a run for a short time after the run ends.
+    for _ in 0..10 {
+        let mut aj = sandbox.spawn_with(&["--id", "again"], &["/bin/true"]);
+        assert_eq!(wait(&mut aj).code(), Some(0));
+    }
+}
+
+#[test]
+#[ignore = "starts a container"]
 fn accepts_an_id_that_looks_like_a_unit_name() {
     let sandbox = Sandbox::new("unit-id");
     let mut aj = sandbox.spawn_with(

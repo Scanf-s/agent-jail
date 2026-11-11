@@ -60,9 +60,8 @@ impl StateDir {
 
     /// Fail if container `id` has a state directory under `root`.
     ///
-    /// `create` makes the final check. This earlier one can run before the runtime runs itself
-    /// again in a systemd scope. Otherwise systemd-run could fail first, on the scope of the
-    /// container that uses the ID, with a message that does not name the cause.
+    /// `create` makes the final check. This earlier one can run before the runtime starts a
+    /// systemd scope for a container that cannot start anyway.
     pub fn check_unused(root: &Path, id: &ContainerId) -> Result<()> {
         let path = root.join(id.as_str());
         match fs::symlink_metadata(&path) {

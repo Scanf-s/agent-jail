@@ -2,7 +2,7 @@ use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
 use crate::paths;
 use crate::user::{Mapping, run_in_user_namespace};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,7 +31,14 @@ impl RunDir {
         let _creating =
             lock(open(runs)?, LockKind::Shared).with_context(|| format!("lock {runs:?}"))?;
         let path = runs.join(id.as_str());
-        fs::create_dir(&path).with_context(|| format!("create {path:?}"))?;
+        match fs::create_dir(&path) {
+            // A container with the same ID under another --root has no state directory under
+            // this one, so only its run directory shows it.
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                bail!("a container with ID {id} already uses the run directory {path:?}")
+            }
+            result => result.with_context(|| format!("create {path:?}"))?,
+        }
         let lock = try_lock(open(&path)?, LockKind::Exclusive)
             .with_context(|| format!("lock {path:?}"))?
             .with_context(|| format!("another process holds the lock of {path:?}"))?;
