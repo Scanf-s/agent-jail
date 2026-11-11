@@ -7,8 +7,6 @@ use std::path::{Path, PathBuf};
 /// `--root`, or `$XDG_RUNTIME_DIR/agent-jail`.
 pub fn state_root(requested: Option<&Path>) -> Result<PathBuf> {
     if let Some(root) = requested {
-        // The runtime runs itself again in a systemd scope. An absolute path stays correct
-        // even if the working directory changes on the way.
         return std::path::absolute(root).with_context(|| format!("resolve --root {root:?}"));
     }
     let runtime_dir =
