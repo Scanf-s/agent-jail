@@ -82,8 +82,7 @@ mod tests {
     fn parses_run_with_default_limits() {
         let args = run_args(&["aj", "run", "/bin/sh"]);
         assert_eq!(args.rootfs, None);
-        assert_eq!(args.cmd, "/bin/sh");
-        assert!(args.args.is_empty());
+        assert_eq!(args.command, ["/bin/sh"]);
         assert_eq!(args.cpus, 1.0);
         assert_eq!(args.mem, 512 * 1024 * 1024);
         assert_eq!(args.pids, 1024);
@@ -109,11 +108,49 @@ mod tests {
             "echo hello",
         ]);
         assert_eq!(args.rootfs, Some(PathBuf::from("./rootfs")));
-        assert_eq!(args.cmd, "/bin/sh");
         assert_eq!(args.cpus, 0.5);
         assert_eq!(args.mem, 1_048_576);
         assert_eq!(args.pids, 64);
-        assert_eq!(args.args, ["-c", "echo hello"]);
+        assert_eq!(args.command, ["/bin/sh", "-c", "echo hello"]);
+    }
+
+    #[test]
+    fn passes_every_argument_after_the_program_to_it() {
+        let args = run_args(&[
+            "aj",
+            "run",
+            "-v",
+            "/src",
+            "/bin/echo",
+            "-v",
+            "-w",
+            "--net",
+            "x",
+        ]);
+        assert_eq!(args.volumes, ["/src"]);
+        assert_eq!(args.workdir, None);
+        assert_eq!(args.net, NetworkMode::Pasta);
+        assert_eq!(args.command, ["/bin/echo", "-v", "-w", "--net", "x"]);
+
+        // A `--` after the program also belongs to it, as in `docker run`.
+        let args = run_args(&["aj", "run", "/bin/echo", "--", "x"]);
+        assert_eq!(args.command, ["/bin/echo", "--", "x"]);
+    }
+
+    #[test]
+    fn requires_a_program() {
+        assert!(Cli::try_parse_from(["aj", "run"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "run", "--net", "none"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "run", "--"]).is_err());
+    }
+
+    #[test]
+    fn rejects_an_unknown_option_before_the_program() {
+        assert!(Cli::try_parse_from(["aj", "run", "--bogus", "/bin/sh"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "run", "--vol", "/x", "/bin/sh"]).is_err());
+        // After `--`, a name that starts with `-` is the program.
+        let args = run_args(&["aj", "run", "--", "-weird", "x"]);
+        assert_eq!(args.command, ["-weird", "x"]);
     }
 
     #[test]
@@ -130,7 +167,7 @@ mod tests {
         let args = run_args(&["aj", "run", "--env", "A=1", "--env", "B", "/bin/sh", "-e"]);
         assert_eq!(args.envs, ["A=1", "B"]);
         // Commands such as `node -e` keep their own -e.
-        assert_eq!(args.args, ["-e"]);
+        assert_eq!(args.command, ["/bin/sh", "-e"]);
     }
 
     #[test]

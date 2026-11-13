@@ -56,6 +56,8 @@ Install any tools you need inside the container. They are removed when the run e
 | `--rootfs DIRECTORY` | Use another rootfs. |
 | `--id ID` | Name the container. See [Check containers](#check-containers). |
 
+Put these options before the command. Every argument after the command goes to the command.
+
 Share the current directory:
 
 ```bash

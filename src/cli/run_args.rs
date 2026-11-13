@@ -50,12 +50,11 @@ pub struct RunArgs {
     #[arg(long, value_enum, default_value_t = NetworkMode::Pasta)]
     pub net: NetworkMode,
 
-    /// Command to execute inside the container.
-    pub cmd: String,
-
-    /// Arguments to pass to the command.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub args: Vec<String>,
+    /// Command to execute inside the container, and its arguments.
+    // One positional, because clap stops parsing aj's options only after the last positional
+    // gets a value. Without allow_hyphen_values, a mistyped option before the program fails.
+    #[arg(value_name = "COMMAND", required = true, trailing_var_arg = true)]
+    pub command: Vec<String>,
 }
 
 impl RunArgs {
@@ -88,17 +87,13 @@ impl RunArgs {
             std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
         })?;
 
-        let mut args = Vec::with_capacity(self.args.len() + 1);
-        args.push(self.cmd);
-        args.extend(self.args);
-
         Ok(ContainerConfig {
             id: self.id,
             rootfs,
             bundle,
             annotations: None,
             process: ProcessConfig {
-                args,
+                args: self.command,
                 env,
                 cwd,
                 uid: 0,
@@ -171,8 +166,7 @@ mod tests {
             workdir: None,
             envs: Vec::new(),
             net: NetworkMode::None,
-            cmd: String::from("true"),
-            args: Vec::new(),
+            command: vec![String::from("true")],
         };
 
         assert!(args.validate().is_ok());
@@ -194,8 +188,11 @@ mod tests {
             workdir: None,
             envs: Vec::new(),
             net: NetworkMode::None,
-            cmd: String::from("/bin/sh"),
-            args: vec![String::from("-c"), String::from("echo hello")],
+            command: vec![
+                String::from("/bin/sh"),
+                String::from("-c"),
+                String::from("echo hello"),
+            ],
         };
 
         let config = args.into_config().unwrap();
