@@ -30,7 +30,6 @@ impl ChildChannels {
         }
     }
 
-    // wait until the parent finishes its cgroup setting
     pub(crate) fn wait_for_cgroup(&mut self) -> Result<()> {
         let fd = self
             .cgroup_reader
@@ -39,7 +38,6 @@ impl ChildChannels {
         wait_ready(&fd, "cgroup")
     }
 
-    // signal to the parent that user/network namespace isolation is done
     pub(crate) fn signal_user_namespace_ready(&mut self) -> Result<()> {
         let fd = self
             .user_namespace_writer
@@ -48,7 +46,6 @@ impl ChildChannels {
         send_ready(&fd, "user namespace")
     }
 
-    // wait until the parent finishes its uid/gid mapping task
     pub(crate) fn wait_for_mapping(&mut self) -> Result<()> {
         let fd = self
             .mapping_reader
@@ -57,7 +54,6 @@ impl ChildChannels {
         wait_ready(&fd, "mapping")
     }
 
-    // signal to the parent that the network namespace exists
     pub(crate) fn signal_network_namespace_ready(&mut self) -> Result<()> {
         let fd = self
             .network_namespace_writer
@@ -66,7 +62,6 @@ impl ChildChannels {
         send_ready(&fd, "network namespace")
     }
 
-    // wait until the parent configures the network of the namespace
     pub(crate) fn wait_for_network(&mut self) -> Result<()> {
         let fd = self
             .network_reader
@@ -75,7 +70,6 @@ impl ChildChannels {
         wait_ready(&fd, "network")
     }
 
-    // signal to the parent that the container is created
     pub(crate) fn signal_created(&mut self) -> Result<()> {
         let fd = self
             .created_writer

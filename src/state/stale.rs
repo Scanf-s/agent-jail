@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 /// Remove the state directories under `root` that no runtime process holds and that nothing
 /// needs any more.
 ///
-/// A killed run cannot remove its own state directory. When the user lingers, systemd clears
-/// `$XDG_RUNTIME_DIR` only at reboot, so these directories would stay until then.
+/// A killed run cannot remove its own state directory. When lingering is enabled for the user,
+/// systemd clears `$XDG_RUNTIME_DIR` only at reboot, so these directories would stay until then.
 pub fn remove_stale(root: &Path) -> Result<()> {
     let Some(mut scan) = find_stale(root)? else {
         return Ok(());

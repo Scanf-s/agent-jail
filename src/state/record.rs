@@ -32,9 +32,9 @@ pub struct Record {
     pub cgroup: PathBuf,
     /// When the runtime created the container, in seconds after the Unix epoch.
     pub created: u64,
-    /// Whether the runtime removes the container when its program ends, as `run` does. OCI
-    /// keeps a container that `create` created until `delete`. Until then, the user does not
-    /// know the container, so it is removed, too.
+    /// Remove the container after its program ends. This is true for `run` and while a
+    /// container is being created, so a failed creation can be cleaned up. After `create`
+    /// prepares the container, this is false: OCI keeps it until `delete`.
     pub auto_delete: bool,
 }
 

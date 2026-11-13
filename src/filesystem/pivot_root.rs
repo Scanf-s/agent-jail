@@ -38,13 +38,11 @@ impl PivotRoot {
     pub fn isolate_filesystem(&self) -> Result<()> {
         self.validate_rootfs()?;
 
-        // Create new mount table for this new process
         self.set_private_mount_namespace()?;
 
         // The overlay is a mount point of its own, as pivot_root requires.
         self.mount_overlay()?;
 
-        // Mount necessary virtual filesystems
         self.mount_proc()?;
         self.mount_sys()?;
         prepare_dev(&self.merged)?;
@@ -52,7 +50,6 @@ impl PivotRoot {
         // only after it.
         let volumes = detach_volumes(&self.volumes)?;
 
-        // Isolate filesystem with new configured mount table using pivot_root
         self.pivot_root()?;
         attach_volumes(volumes)
     }
@@ -93,7 +90,6 @@ impl PivotRoot {
         Ok(())
     }
 
-    // Create new namespace and mount table for the new process
     fn set_private_mount_namespace(&self) -> Result<()> {
         unshare(CloneFlags::CLONE_NEWNS).context("unshare(CLONE_NEWNS)")?;
         mount::<str, _, str, str>(None, "/", None, MsFlags::MS_REC | MsFlags::MS_PRIVATE, None)
@@ -101,7 +97,6 @@ impl PivotRoot {
         Ok(())
     }
 
-    // create and mount new proc virtual filesystem
     fn mount_proc(&self) -> Result<()> {
         let proc_path = self.merged.join("proc");
         fs::create_dir_all(&proc_path)

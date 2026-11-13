@@ -2,32 +2,33 @@ use crate::cgroups::{self, Cgroup};
 use crate::config::{ContainerConfig, NetworkMode};
 use crate::container;
 use crate::filesystem::{PivotRoot, RunDir};
-use crate::ipc::{self, ChildChannels, StartupChannels};
+use crate::ipc::{ChildChannels, StartupChannels};
 use crate::network;
 use crate::pidfd;
 use crate::proc_stat;
-use crate::signals::{self, Event, RuntimeSignals, TERMINATION_SIGNALS};
+use crate::signals::{self, RuntimeSignals};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+use nix::sys::wait::waitpid;
 use nix::unistd::{
     ForkResult, Gid, Pid, Uid, chdir, dup2, fork, getppid, setgid, setgroups, setsid, setuid,
 };
 use oci_spec::runtime::ContainerState;
-use start::{StartRequest, StartSocket};
-use startup::Report;
+use start::StartSocket;
 use std::fs::OpenOptions;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
+use supervision::{Outcome, Startup, supervise, watch_setup_process};
 
 mod start;
 mod startup;
+mod supervision;
 
 pub use start::start;
 
@@ -39,14 +40,6 @@ enum Mode {
     /// Exit when the container is created, and keep it until a later command starts it, as
     /// OCI `create` does.
     Create,
-}
-
-/// How the wait of the runtime for the setup process ended.
-enum Outcome {
-    /// `create` created the container.
-    Created,
-    /// The setup process ended with this exit code.
-    Exited(u8),
 }
 
 pub struct Runtime {
@@ -368,7 +361,7 @@ impl Runtime {
                     .set_status(ContainerState::Created)
                     .set_pid(Some(init.as_raw()));
                 record.init_start_time = Some(start_time);
-                // From now on, the user knows the container, so it stays until deleted.
+                // A container prepared by `create` stays until it is deleted.
                 record.auto_delete = mode == Mode::Run;
             })
             .context("record that the container is created")
@@ -473,433 +466,4 @@ fn detach() -> Result<()> {
 /// closed when it waits for the start of the program.
 fn end_with_monitor() -> Result<()> {
     set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")
-}
-
-/// Wait until the setup process `child` reports on `created` that the container is created,
-/// in `Create` mode, or until it ends. `on_created` runs when the setup process reports. It
-/// receives the termination signal that cancelled `aj create`, if one did.
-///
-/// The termination signals that usually reach only the runtime, for example from `kill` or a
-/// process manager, go to the setup process. In `Create` mode, such a signal cancels the
-/// create: this waits until the setup process ends, and the container does not stay.
-fn watch_setup_process(
-    child: Pid,
-    signals: &RuntimeSignals,
-    created: OwnedFd,
-    mode: Mode,
-    mut on_created: impl FnMut(Option<Signal>),
-) -> Result<Outcome> {
-    let forwarded: &[Signal] = match mode {
-        // A terminal sends SIGINT and SIGQUIT to the whole foreground process group, so the
-        // setup process and the container already receive them.
-        Mode::Run => &[Signal::SIGTERM, Signal::SIGHUP],
-        // The setup process has a session of its own.
-        Mode::Create => &TERMINATION_SIGNALS,
-    };
-    let mut created = Some(created);
-    let mut cancelled = None;
-    loop {
-        let event = match &created {
-            Some(pipe) => signals.wait_or_readable(&[pipe.as_fd()]),
-            None => signals.wait().map(Event::Signal),
-        };
-        let signal = match event {
-            Ok(Event::Signal(signal)) => signal,
-            Ok(Event::Readable(_)) => {
-                // At EOF, the setup process ended before it reported, and SIGCHLD follows.
-                if let Some(pipe) = created.take()
-                    && ipc::read_ready(&pipe, "created")?
-                {
-                    on_created(cancelled);
-                    if mode == Mode::Create && cancelled.is_none() {
-                        return Ok(Outcome::Created);
-                    }
-                }
-                continue;
-            }
-            // Returning early would remove the run directory while the container still uses it.
-            Err(error) => {
-                report!("aj: warning: {error:#}");
-                let status = waitpid(child, None).context("waitpid failed")?;
-                return Ok(Outcome::Exited(exit_status(status)?));
-            }
-        };
-        match signal {
-            Signal::SIGCHLD => {
-                let status =
-                    match waitpid(child, Some(WaitPidFlag::WNOHANG)).context("waitpid failed")? {
-                        WaitStatus::StillAlive => continue,
-                        status => status,
-                    };
-                // The setup process can report and end before this reads the report, for
-                // example when `aj start` runs a short program at once. The created container
-                // stays until it is deleted, as OCI requires.
-                if mode == Mode::Create
-                    && cancelled.is_none()
-                    && let Some(pipe) = created.take()
-                    && ipc::has_signaled(&pipe, "created")?
-                {
-                    return Ok(Outcome::Created);
-                }
-                let code = match cancelled {
-                    Some(signal) => 128 + signal as u8,
-                    None => exit_status(status)?,
-                };
-                return Ok(Outcome::Exited(code));
-            }
-            signal if forwarded.contains(&signal) => {
-                let _ = kill(child, signal);
-                if mode == Mode::Create {
-                    cancelled.get_or_insert(signal);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// What container init did before its program ran.
-enum Startup {
-    /// Init is ready to execute the program.
-    Created,
-    /// Init executed the program.
-    Running,
-    /// Init cannot run the program, for this reason.
-    Failed(String),
-}
-
-/// Wait until container init ends, and return the exit code for the runtime.
-///
-/// `channel` is the end of the startup channel that the setup process keeps. This passes what
-/// init does before its program runs to `on_startup`. After `on_startup` accepted
-/// `Startup::Created`, this starts the program: at once without `socket`, or when `aj start`
-/// asks on `socket`. When the process of the pidfd `runtime` ends, this ends init.
-///
-/// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
-fn supervise(
-    init: Pid,
-    signals: &RuntimeSignals,
-    channel: UnixStream,
-    socket: Option<StartSocket>,
-    runtime: Option<BorrowedFd>,
-    on_startup: impl FnMut(Startup) -> Result<()>,
-) -> Result<u8> {
-    let result = wait_for_init(init, signals, channel, socket, runtime, on_startup);
-    if result.is_err() {
-        let _ = kill(init, Signal::SIGKILL);
-        let _ = waitpid(init, None);
-    }
-    result
-}
-
-/// What `wait_for_init` waits for, besides signals.
-#[derive(Clone, Copy)]
-enum Source {
-    /// The startup channel of init.
-    Channel,
-    /// The socket on which `aj start` asks for the start.
-    Socket,
-    /// The runtime process of `aj run`.
-    Runtime,
-}
-
-fn wait_for_init(
-    init: Pid,
-    signals: &RuntimeSignals,
-    channel: UnixStream,
-    mut socket: Option<StartSocket>,
-    mut runtime: Option<BorrowedFd>,
-    mut on_startup: impl FnMut(Startup) -> Result<()>,
-) -> Result<u8> {
-    let start_at_once = socket.is_none();
-    let mut channel = Some(channel);
-    // Whether init is ready to execute the program.
-    let mut created = false;
-    // Whether init was told to execute the program.
-    let mut started = false;
-    // The `aj start` that waits until the program runs.
-    let mut request = None;
-    // The termination signal for which the runtime killed init.
-    let mut termination_signal = None;
-    loop {
-        // While the channel is open, it comes first.
-        let mut sources = Vec::new();
-        let mut fds = Vec::new();
-        if let Some(channel) = &channel {
-            sources.push(Source::Channel);
-            fds.push(channel.as_fd());
-        }
-        // A request that comes earlier waits in the socket.
-        if created && let Some(socket) = &socket {
-            sources.push(Source::Socket);
-            fds.push(socket.as_fd());
-        }
-        if let Some(runtime) = runtime {
-            sources.push(Source::Runtime);
-            fds.push(runtime);
-        }
-        // While init starts, signals must still reach this loop. Otherwise Ctrl-C could not end
-        // an init that hangs before exec.
-        let event = if fds.is_empty() {
-            Event::Signal(signals.wait()?)
-        } else {
-            signals.wait_or_readable(&fds)?
-        };
-        drop(fds);
-        let signal = match event {
-            Event::Signal(signal) => signal,
-            Event::Readable(index) if matches!(sources[index], Source::Runtime) => {
-                // The runtime of `aj run` was killed, and the container must not outlive it.
-                runtime = None;
-                let _ = kill(init, Signal::SIGKILL);
-                continue;
-            }
-            Event::Readable(index) if matches!(sources[index], Source::Channel) => {
-                let Some(open) = &channel else {
-                    continue;
-                };
-                match startup::read_report(open)? {
-                    Report::Ready => {
-                        on_startup(Startup::Created)?;
-                        created = true;
-                        if start_at_once {
-                            startup::start(open)?;
-                            started = true;
-                        }
-                    }
-                    report => {
-                        channel = None;
-                        conclude(conclusion(report, started), &mut on_startup, request.take())?;
-                    }
-                }
-                continue;
-            }
-            Event::Readable(_) => {
-                let Some(listening) = &socket else {
-                    continue;
-                };
-                let pending = match listening.accept() {
-                    Ok(Some(pending)) => pending,
-                    Ok(None) => continue,
-                    // A failed connection does not change the container.
-                    Err(error) => {
-                        report!("aj: warning: {error:#}");
-                        continue;
-                    }
-                };
-                // Without the channel, init has ended, and dropping the request tells the
-                // client that the program did not start.
-                let Some(open) = &channel else {
-                    continue;
-                };
-                startup::start(open)?;
-                started = true;
-                request = Some(pending);
-                if let Some(socket) = socket.take() {
-                    socket.close();
-                }
-                continue;
-            }
-        };
-        match signal {
-            Signal::SIGCHLD => {
-                if !has_ended(init)? {
-                    continue;
-                }
-                // Init can report and end before this loop reads the report. Its end of the
-                // channel closed when it ended, so these reads do not block.
-                if let Some(open) = channel.take() {
-                    loop {
-                        match startup::read_report(&open)? {
-                            // The program cannot start any more.
-                            Report::Ready => {}
-                            report => {
-                                conclude(
-                                    conclusion(report, started),
-                                    &mut on_startup,
-                                    request.take(),
-                                )?;
-                                break;
-                            }
-                        }
-                    }
-                }
-                let status = waitpid(init, None).context("waitpid(init) failed")?;
-                return exit_code_with_termination_signal(status, termination_signal);
-            }
-            signal => {
-                let default_action = match signals::uses_default_action(init, signal) {
-                    Ok(default_action) => default_action,
-                    // Passing the signal on leaves the decision to the program, as if it had
-                    // a handler.
-                    Err(error) => {
-                        report!("aj: warning: pass {signal} on to the container: {error:#}");
-                        false
-                    }
-                };
-                if default_action {
-                    // Outside a container, the program would end on this signal. As PID 1 it
-                    // does not receive the signal, so the runtime ends it.
-                    termination_signal.get_or_insert(signal);
-                    let _ = kill(init, Signal::SIGKILL);
-                } else if matches!(signal, Signal::SIGTERM | Signal::SIGHUP) {
-                    // The terminal does not send these to init, so the runtime passes them on.
-                    let _ = kill(init, signal);
-                }
-            }
-        }
-    }
-}
-
-/// Pass `startup`, what the startup channel showed at its end, to `on_startup`, and answer
-/// `request` with the result.
-fn conclude(
-    startup: Option<Startup>,
-    on_startup: &mut impl FnMut(Startup) -> Result<()>,
-    request: Option<StartRequest>,
-) -> Result<()> {
-    let (result, answer) = match startup {
-        Some(Startup::Running) => match on_startup(Startup::Running) {
-            Ok(()) => (Ok(()), Ok(())),
-            Err(error) => {
-                let message = format!("{error:#}");
-                (Err(error), Err(message))
-            }
-        },
-        Some(Startup::Failed(message)) => {
-            (on_startup(Startup::Failed(message.clone())), Err(message))
-        }
-        // The channel ends without a created report. Dropping the request tells the client
-        // that the program did not start.
-        Some(Startup::Created) | None => return Ok(()),
-    };
-    if let Some(request) = request {
-        request.answer(answer);
-    }
-    result
-}
-
-/// What the last report of init on the startup channel shows, if `started` tells whether init
-/// was told to execute the program.
-fn conclusion(report: Report, started: bool) -> Option<Startup> {
-    match report {
-        Report::Ready => None,
-        // After the start, init closes its end when the exec succeeds. The program may have
-        // ended already, as /bin/true does.
-        Report::Closed if started => Some(Startup::Running),
-        // Init ended before it could run the program, for example on SIGKILL.
-        Report::Closed => None,
-        Report::Failed(message) => Some(Startup::Failed(message)),
-    }
-}
-
-/// Whether `init` has ended. This does not reap it, so its exit status and its `/proc` entry
-/// stay.
-fn has_ended(init: Pid) -> Result<bool> {
-    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
-    let status = waitid(Id::Pid(init), flags).context("waitid(init) failed")?;
-    Ok(status != WaitStatus::StillAlive)
-}
-
-/// Like `exit_status`, but if the runtime killed init for a termination signal, the code shows
-/// that signal instead of SIGKILL.
-fn exit_code_with_termination_signal(
-    status: WaitStatus,
-    termination_signal: Option<Signal>,
-) -> Result<u8> {
-    match (status, termination_signal) {
-        (WaitStatus::Signaled(_, Signal::SIGKILL, _), Some(signal)) => Ok(128 + signal as u8),
-        _ => exit_status(status),
-    }
-}
-
-/// The exit code that a shell reports for `status`.
-fn exit_status(status: WaitStatus) -> Result<u8> {
-    match status {
-        WaitStatus::Exited(_, code) => Ok(code as u8),
-        WaitStatus::Signaled(_, signal, _) => Ok(128 + signal as u8),
-        other => bail!("unexpected wait status: {other:?}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nix::libc;
-    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use nix::sys::signal::{SigSet, raise};
-    use nix::unistd::pipe;
-
-    /// Fork a setup process that reports that the container is created and then runs `then`.
-    /// Returns its PID and the pipe of the report.
-    fn report_created(then: fn()) -> (Pid, OwnedFd) {
-        let (reader, writer) = pipe().unwrap();
-        // SAFETY: the test process has other threads, so the child makes only
-        // async-signal-safe calls.
-        match unsafe { fork() }.unwrap() {
-            ForkResult::Child => {
-                let _ = ipc::send_ready(&writer, "created");
-                then();
-                unsafe { libc::_exit(0) }
-            }
-            ForkResult::Parent { child } => (child, reader),
-        }
-    }
-
-    /// Wait until `child` ends, and then raise SIGCHLD in this thread. The kernel sends SIGCHLD
-    /// to the process, so another thread of the tests can take it.
-    fn report_end(child: Pid) {
-        waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
-        raise(Signal::SIGCHLD).unwrap();
-    }
-
-    #[test]
-    fn keeps_a_container_whose_setup_process_ended_before_the_report_was_read() {
-        let signals = RuntimeSignals::block().unwrap();
-        let (child, created) = report_created(|| {});
-        report_end(child);
-
-        let outcome = watch_setup_process(child, &signals, created, Mode::Create, |_| {});
-
-        assert!(matches!(outcome.unwrap(), Outcome::Created));
-    }
-
-    #[test]
-    fn a_termination_signal_cancels_create() {
-        let signals = RuntimeSignals::block().unwrap();
-        // The setup process inherits the blocked signals, so it waits for the forwarded one.
-        let (child, created) = report_created(|| {
-            let _ = SigSet::from(Signal::SIGINT).wait();
-        });
-        // Ctrl-C comes right after the report, before the runtime reads it.
-        raise(Signal::SIGINT).unwrap();
-        let mut report = [PollFd::new(created.as_fd(), PollFlags::POLLIN)];
-        poll(&mut report, PollTimeout::NONE).unwrap();
-
-        let outcome = watch_setup_process(child, &signals, created, Mode::Create, |_| {
-            report_end(child)
-        });
-
-        assert!(matches!(outcome.unwrap(), Outcome::Exited(130)));
-    }
-
-    #[test]
-    fn reports_the_termination_signal_when_the_runtime_killed_init() {
-        let pid = Pid::from_raw(42);
-        let killed = WaitStatus::Signaled(pid, Signal::SIGKILL, false);
-        assert_eq!(
-            exit_code_with_termination_signal(killed, Some(Signal::SIGINT)).unwrap(),
-            130
-        );
-        assert_eq!(
-            exit_code_with_termination_signal(killed, None).unwrap(),
-            137
-        );
-        // Init can exit by itself just before the runtime kills it.
-        let exited = WaitStatus::Exited(pid, 3);
-        assert_eq!(
-            exit_code_with_termination_signal(exited, Some(Signal::SIGTERM)).unwrap(),
-            3
-        );
-    }
 }

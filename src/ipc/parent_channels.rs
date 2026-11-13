@@ -30,7 +30,6 @@ impl ParentChannels {
         }
     }
 
-    // signal to the child that cgroup task is done
     pub(crate) fn signal_cgroup_ready(&mut self) -> Result<()> {
         let fd = self
             .cgroup_writer
@@ -39,7 +38,6 @@ impl ParentChannels {
         send_ready(&fd, "cgroup")
     }
 
-    // wait until the child finishes its user/network namespace isolation
     pub(crate) fn wait_for_user_namespace(&mut self) -> Result<()> {
         let fd = self
             .user_namespace_reader
@@ -48,7 +46,6 @@ impl ParentChannels {
         wait_ready(&fd, "user namespace")
     }
 
-    // signal to the child that uid/gid mapping task is done
     pub(crate) fn signal_mapping_ready(&mut self) -> Result<()> {
         let fd = self
             .mapping_writer
@@ -57,7 +54,6 @@ impl ParentChannels {
         send_ready(&fd, "mapping")
     }
 
-    // wait until the child creates its network namespace
     pub(crate) fn wait_for_network_namespace(&mut self) -> Result<()> {
         let fd = self
             .network_namespace_reader
@@ -66,7 +62,6 @@ impl ParentChannels {
         wait_ready(&fd, "network namespace")
     }
 
-    // signal to the child that the network of its namespace is configured
     pub(crate) fn signal_network_ready(&mut self) -> Result<()> {
         let fd = self
             .network_writer
@@ -75,8 +70,7 @@ impl ParentChannels {
         send_ready(&fd, "network")
     }
 
-    // the pipe on which the child signals that the container is created. The parent waits for
-    // it together with signals, so it reads the pipe itself.
+    // The parent waits for this pipe and for signals together, so it reads the pipe itself.
     pub(crate) fn take_created_reader(&mut self) -> Result<OwnedFd> {
         self.created_reader
             .take()

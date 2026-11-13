@@ -16,7 +16,6 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "DIR")]
     pub root: Option<PathBuf>,
 
-    /// The subcommand to dispatch (run, ...).
     #[command(subcommand)]
     pub command: Command,
 }
@@ -52,7 +51,7 @@ pub enum Command {
         #[arg(value_parser = ContainerId::parse)]
         id: ContainerId,
     },
-    /// List the containers that are running or that a killed run left behind.
+    /// List containers and their current status.
     List,
 }
 

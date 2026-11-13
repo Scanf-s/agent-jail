@@ -10,7 +10,6 @@ pub struct Bundle {
 }
 
 impl Bundle {
-    // Parse config.json
     pub fn load(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path)
             .with_context(|| format!("resolve bundle path {}", path.display()))?;

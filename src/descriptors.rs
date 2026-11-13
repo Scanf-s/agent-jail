@@ -70,7 +70,7 @@ fn close_listed_on_exec(first: libc::c_uint) -> Result<()> {
     Ok(())
 }
 
-/// The descriptors from `first` on that `/proc/self/fd` lists.
+/// List open file descriptors with numbers greater than or equal to `first`.
 fn open_descriptors(first: libc::c_uint) -> Result<Vec<RawFd>> {
     let mut fds = Vec::new();
     for entry in fs::read_dir("/proc/self/fd").context("read /proc/self/fd")? {

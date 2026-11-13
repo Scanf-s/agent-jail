@@ -6,7 +6,7 @@ Changes to shared host files are kept.
 
 ## Requirements
 
-Linux is required. On macOS, use a Linux virtual machine.
+Linux is required. On macOS, follow the [Linux virtual machine setup](MACOS.md).
 
 - cgroup v2 and user namespaces enabled for users without root access.
 - systemd as PID 1, with a working user service manager.
@@ -103,7 +103,9 @@ aj state build
 The state of each container is stored in `$XDG_RUNTIME_DIR/agent-jail`. `aj run` removes it when the program ends.
 Use `aj --root DIRECTORY` to store it in another directory.
 If `aj` is killed, its container ends too.
-`aj` runs as two processes. If both are killed, for example with `pkill -9 aj`, `aj list` shows the container as `stopped`, and a program that changes its user, for example with `su`, can keep running.
+`aj` runs as two processes: the runtime and the setup process.
+If both are killed, for example with `pkill -9 aj`, `aj list` shows the container as `stopped`.
+A program that changes its user, for example with `su`, can keep running after both processes are killed.
 The next `aj run` or `aj create` ends such a program and removes what the killed run left behind.
 
 ## OCI bundles
