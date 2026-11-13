@@ -70,6 +70,20 @@ fn main() -> Result<ExitCode> {
             print!("{}", state::table(&state::list(&state_root)?));
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Delete { id, force } => {
+            state::delete(&state_root, &id, force)?;
+            // A setup process that was killed leaves the run directory of its container. The
+            // cleanup removes every run directory that no runtime holds, as `run` does.
+            match user::Mapping::for_current_user() {
+                Ok(mapping) => {
+                    if let Err(error) = filesystem::remove_stale_run_dirs(&mapping) {
+                        report!("aj: warning: remove stale run directories: {error:#}");
+                    }
+                }
+                Err(error) => report!("aj: warning: remove stale run directories: {error:#}"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

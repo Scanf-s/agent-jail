@@ -1,8 +1,10 @@
+mod delete;
 mod dir;
 mod query;
 mod record;
 mod stale;
 
+pub use delete::delete;
 pub use dir::StateDir;
 pub use query::{list, read, table};
 pub use record::Record;

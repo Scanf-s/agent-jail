@@ -53,6 +53,15 @@ pub enum Command {
     },
     /// List containers and their current status.
     List,
+    /// Delete a stopped container: end its processes and remove its state.
+    Delete {
+        /// Also delete a container that is not stopped, after ending its processes.
+        #[arg(long)]
+        force: bool,
+        /// Container ID.
+        #[arg(value_parser = ContainerId::parse)]
+        id: ContainerId,
+    },
 }
 
 #[cfg(test)]
@@ -229,6 +238,19 @@ mod tests {
         let cli = Cli::try_parse_from(["aj", "--root", "/state", "list"]).unwrap();
         assert!(matches!(cli.command, Command::List));
         assert_eq!(cli.root, Some(PathBuf::from("/state")));
+    }
+
+    #[test]
+    fn parses_delete() {
+        let cli = Cli::try_parse_from(["aj", "delete", "box"]).unwrap();
+        let Command::Delete { id, force } = cli.command else {
+            panic!("expected the delete command");
+        };
+        assert_eq!((id.as_str(), force), ("box", false));
+
+        let cli = Cli::try_parse_from(["aj", "delete", "--force", "box"]).unwrap();
+        assert!(matches!(cli.command, Command::Delete { force: true, .. }));
+        assert!(Cli::try_parse_from(["aj", "delete"]).is_err());
     }
 
     #[test]

@@ -290,3 +290,109 @@ fn a_started_container_ends_with_its_setup_process() {
     wait_until_ended(init);
     assert_eq!(sandbox.state("box")["status"], "stopped");
 }
+
+#[test]
+#[ignore = "starts a container"]
+fn delete_removes_a_stopped_container() {
+    let sandbox = Sandbox::new("delete");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    let init = init_of(&sandbox.state("box"));
+    let setup = parent_of(init);
+    kill(init, Signal::SIGKILL).unwrap();
+    sandbox.wait_for_status("box", "stopped");
+
+    let deleted = sandbox.aj(&["delete", "box"]);
+
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    // delete waits until the setup process has finished its own cleanup.
+    assert!(!is_running(setup));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+    assert_eq!(sandbox.run_dirs(), 0);
+    let state = sandbox.aj(&["state", "box"]);
+    assert!(!state.status.success());
+    assert!(String::from_utf8_lossy(&state.stderr).contains("no container"));
+    // The ID is free again.
+    let again = sandbox.create(&bundle, "box");
+    assert!(again.status.success(), "{}", again.stderr);
+    let init = init_of(&sandbox.state("box"));
+    kill(init, Signal::SIGKILL).unwrap();
+    wait_until_ended(init);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn delete_fails_without_effect_unless_the_container_is_stopped() {
+    let sandbox = Sandbox::new("delete-refused");
+    let missing = sandbox.aj(&["delete", "box"]);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no container"));
+
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    let init = init_of(&sandbox.state("box"));
+    for status in ["created", "running"] {
+        if status == "running" {
+            assert!(sandbox.aj(&["start", "box"]).status.success());
+        }
+
+        let refused = sandbox.aj(&["delete", "box"]);
+
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains(&format!("box is {status}")), "{stderr}");
+        assert_eq!(sandbox.state("box")["status"], status);
+        assert!(is_running(init));
+    }
+    kill(init, Signal::SIGKILL).unwrap();
+    wait_until_ended(init);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn delete_force_ends_and_removes_a_running_container() {
+    let sandbox = Sandbox::new("delete-force");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    assert!(sandbox.create(&bundle, "box").status.success());
+    assert!(sandbox.aj(&["start", "box"]).status.success());
+    let init = init_of(&sandbox.state("box"));
+
+    let deleted = sandbox.aj(&["delete", "--force", "box"]);
+
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    assert!(!is_running(init));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+    assert_eq!(sandbox.run_dirs(), 0);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn delete_force_ends_a_container_of_run() {
+    let sandbox = Sandbox::new("delete-run");
+    let mut aj = sandbox.spawn_with(
+        &["--id", "box"],
+        &["/bin/sh", "-c", "touch /out/ready && exec sleep 60"],
+    );
+    sandbox.wait_until_ready();
+    sandbox.wait_until_running();
+
+    let deleted = sandbox.aj(&["delete", "--force", "box"]);
+
+    assert!(
+        deleted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deleted.stderr)
+    );
+    // The program ended on SIGKILL, and the run removed what it owned.
+    assert_eq!(wait(&mut aj).code(), Some(137));
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
+    assert_eq!(sandbox.run_dirs(), 0);
+}

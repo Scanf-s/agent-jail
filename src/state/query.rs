@@ -98,7 +98,7 @@ fn current_status(recorded: ContainerState, init_runs: bool, lock_held: bool) ->
 ///
 /// The check takes a shared lock, which never excludes another check, so two commands that
 /// check at the same time both see the truth.
-fn lock_held(dir: &Path) -> Result<bool> {
+pub(super) fn lock_held(dir: &Path) -> Result<bool> {
     let file = File::open(dir).with_context(|| format!("open {dir:?}"))?;
     let probe = try_lock(file, LockKind::Shared).with_context(|| format!("lock {dir:?}"))?;
     Ok(probe.is_none())

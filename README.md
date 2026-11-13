@@ -125,8 +125,14 @@ aj start build
 `aj create` returns when the container is ready. Without `--bundle`, it uses the current directory.
 If you stop `aj create` with Ctrl-C before it returns, it removes the container.
 The program receives the standard input and output of `aj create`, but it runs only after `aj start`.
-After the program ends, the container stays as `stopped` and keeps its ID.
-`aj` cannot delete such a container yet.
+After the program ends, the container stays as `stopped` and keeps its ID until you delete it:
+
+```bash
+aj delete build
+```
+
+`aj delete` deletes only a stopped container.
+Add `--force` to end the program of a created or running container and delete it.
 
 When you log out, systemd ends these containers, unless lingering is enabled for your user (`loginctl enable-linger`).
 
