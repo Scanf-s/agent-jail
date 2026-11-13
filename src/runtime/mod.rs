@@ -110,9 +110,10 @@ impl Runtime {
     fn run_parent(&mut self, child: Pid, signals: &RuntimeSignals, mode: Mode) -> Result<ExitCode> {
         let result = match self.wait_for_container(child, signals, mode) {
             Ok(Outcome::Created) => {
-                // The setup process now waits for the start, and it removes the run directory
-                // when init ends. The state stays until the container is deleted. The container
-                // cgroup holds init, so dropping it here does not remove it.
+                // The setup process removes the run directory when init ends, also if init has
+                // ended already. The state stays until the container is deleted. Dropping the
+                // cgroup removes it only after init ended, because a cgroup that holds a
+                // process cannot be removed.
                 self.state_dir.keep();
                 return Ok(ExitCode::SUCCESS);
             }
@@ -160,30 +161,14 @@ impl Runtime {
             }
         };
 
-        let forwarded: &[Signal] = match mode {
-            // A terminal sends SIGINT and SIGQUIT to the whole foreground process group, so the
-            // setup process and the container already receive them.
-            Mode::Run => &[Signal::SIGTERM, Signal::SIGHUP],
-            // The setup process has a session of its own.
-            Mode::Create => &TERMINATION_SIGNALS,
-        };
-        let mut created = Some(created);
-        loop {
-            match wait_for_setup_process(child, signals, created.take(), forwarded)? {
-                SetupEvent::Created => {
-                    // Init has its own cgroup now. In the container cgroup, the setup process
-                    // would count against the memory limit of the container, and the OOM killer
-                    // could end it.
-                    if let Err(error) = self.cgroup.move_to_runtime(child) {
-                        report!("aj: warning: {error:#}");
-                    }
-                    if mode == Mode::Create {
-                        return Ok(Outcome::Created);
-                    }
-                }
-                SetupEvent::Ended(status) => return Ok(Outcome::Exited(exit_status(status)?)),
+        let cgroup = &self.cgroup;
+        watch_setup_process(child, signals, created, mode, || {
+            // Init has its own cgroup now. In the container cgroup, the setup process would
+            // count against the memory limit of the container, and the OOM killer could end it.
+            if let Err(error) = cgroup.move_to_runtime(child) {
+                report!("aj: warning: {error:#}");
             }
-        }
+        })
     }
 
     /// Set up the container with the setup process `child`. Returns the read end of the pipe on
@@ -450,25 +435,26 @@ fn end_with_monitor() -> Result<()> {
     set_pdeathsig(Signal::SIGKILL).context("set the parent death signal")
 }
 
-/// What the runtime saw of the setup process.
-enum SetupEvent {
-    /// The setup process reported that the container is created.
-    Created,
-    /// The setup process ended with this status.
-    Ended(WaitStatus),
-}
-
-/// Wait until the setup process reports on `created` that the container is created, or until
-/// it ends. Without `created`, wait until it ends.
+/// Wait until the setup process `child` reports on `created` that the container is created,
+/// in `Create` mode, or until it ends. `on_created` runs when the setup process reports.
 ///
-/// The signals in `forwarded` usually reach only the runtime, for example from `kill` or a
-/// process manager, so they go to the setup process.
-fn wait_for_setup_process(
+/// The termination signals that usually reach only the runtime, for example from `kill` or a
+/// process manager, go to the setup process.
+fn watch_setup_process(
     child: Pid,
     signals: &RuntimeSignals,
-    mut created: Option<OwnedFd>,
-    forwarded: &[Signal],
-) -> Result<SetupEvent> {
+    created: OwnedFd,
+    mode: Mode,
+    mut on_created: impl FnMut(),
+) -> Result<Outcome> {
+    let forwarded: &[Signal] = match mode {
+        // A terminal sends SIGINT and SIGQUIT to the whole foreground process group, so the
+        // setup process and the container already receive them.
+        Mode::Run => &[Signal::SIGTERM, Signal::SIGHUP],
+        // The setup process has a session of its own.
+        Mode::Create => &TERMINATION_SIGNALS,
+    };
+    let mut created = Some(created);
     loop {
         let event = match &created {
             Some(pipe) => signals.wait_or_readable(&[pipe.as_fd()]),
@@ -481,7 +467,10 @@ fn wait_for_setup_process(
                 if let Some(pipe) = created.take()
                     && ipc::read_ready(&pipe, "created")?
                 {
-                    return Ok(SetupEvent::Created);
+                    on_created();
+                    if mode == Mode::Create {
+                        return Ok(Outcome::Created);
+                    }
                 }
                 continue;
             }
@@ -489,15 +478,26 @@ fn wait_for_setup_process(
             Err(error) => {
                 report!("aj: warning: {error:#}");
                 let status = waitpid(child, None).context("waitpid failed")?;
-                return Ok(SetupEvent::Ended(status));
+                return Ok(Outcome::Exited(exit_status(status)?));
             }
         };
         match signal {
             Signal::SIGCHLD => {
-                match waitpid(child, Some(WaitPidFlag::WNOHANG)).context("waitpid failed")? {
-                    WaitStatus::StillAlive => {}
-                    status => return Ok(SetupEvent::Ended(status)),
+                let status =
+                    match waitpid(child, Some(WaitPidFlag::WNOHANG)).context("waitpid failed")? {
+                        WaitStatus::StillAlive => continue,
+                        status => status,
+                    };
+                // The setup process can report and end before this reads the report, for
+                // example when `aj start` runs a short program at once. The created container
+                // stays until it is deleted, as OCI requires.
+                if mode == Mode::Create
+                    && let Some(pipe) = created.take()
+                    && ipc::has_signaled(&pipe, "created")?
+                {
+                    return Ok(Outcome::Created);
                 }
+                return Ok(Outcome::Exited(exit_status(status)?));
             }
             signal if forwarded.contains(&signal) => {
                 let _ = kill(child, signal);
@@ -747,6 +747,43 @@ fn exit_status(status: WaitStatus) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::libc;
+    use nix::sys::signal::raise;
+    use nix::unistd::pipe;
+
+    /// Fork a setup process that reports that the container is created and then runs `then`.
+    /// Returns its PID and the pipe of the report.
+    fn report_created(then: fn()) -> (Pid, OwnedFd) {
+        let (reader, writer) = pipe().unwrap();
+        // SAFETY: the test process has other threads, so the child makes only
+        // async-signal-safe calls.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let _ = ipc::send_ready(&writer, "created");
+                then();
+                unsafe { libc::_exit(0) }
+            }
+            ForkResult::Parent { child } => (child, reader),
+        }
+    }
+
+    /// Wait until `child` ends, and then raise SIGCHLD in this thread. The kernel sends SIGCHLD
+    /// to the process, so another thread of the tests can take it.
+    fn report_end(child: Pid) {
+        waitid(Id::Pid(child), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT).unwrap();
+        raise(Signal::SIGCHLD).unwrap();
+    }
+
+    #[test]
+    fn keeps_a_container_whose_setup_process_ended_before_the_report_was_read() {
+        let signals = RuntimeSignals::block().unwrap();
+        let (child, created) = report_created(|| {});
+        report_end(child);
+
+        let outcome = watch_setup_process(child, &signals, created, Mode::Create, || {});
+
+        assert!(matches!(outcome.unwrap(), Outcome::Created));
+    }
 
     #[test]
     fn reports_the_termination_signal_when_the_runtime_killed_init() {
