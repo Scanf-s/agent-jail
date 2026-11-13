@@ -162,11 +162,25 @@ impl Runtime {
         };
 
         let cgroup = &self.cgroup;
-        watch_setup_process(child, signals, created, mode, || {
+        watch_setup_process(child, signals, created, mode, |cancelled| {
             // Init has its own cgroup now. In the container cgroup, the setup process would
             // count against the memory limit of the container, and the OOM killer could end it.
-            if let Err(error) = cgroup.move_to_runtime(child) {
-                report!("aj: warning: {error:#}");
+            let moved = cgroup.move_to_runtime(child);
+            match cancelled {
+                None => {
+                    if let Err(error) = moved {
+                        report!("aj: warning: {error:#}");
+                    }
+                }
+                // The setup process created the container before it handled the signal. If a
+                // quick `aj start` has run the program, the program may ignore the signal, so
+                // this ends the container. A setup process that has ended cannot move, and
+                // then nothing waits for this to end.
+                Some(_) => {
+                    if let Err(error) = cgroup.kill_all() {
+                        report!("aj: warning: {error:#}");
+                    }
+                }
             }
         })
     }
@@ -436,16 +450,18 @@ fn end_with_monitor() -> Result<()> {
 }
 
 /// Wait until the setup process `child` reports on `created` that the container is created,
-/// in `Create` mode, or until it ends. `on_created` runs when the setup process reports.
+/// in `Create` mode, or until it ends. `on_created` runs when the setup process reports. It
+/// receives the termination signal that cancelled `aj create`, if one did.
 ///
 /// The termination signals that usually reach only the runtime, for example from `kill` or a
-/// process manager, go to the setup process.
+/// process manager, go to the setup process. In `Create` mode, such a signal cancels the
+/// create: this waits until the setup process ends, and the container does not stay.
 fn watch_setup_process(
     child: Pid,
     signals: &RuntimeSignals,
     created: OwnedFd,
     mode: Mode,
-    mut on_created: impl FnMut(),
+    mut on_created: impl FnMut(Option<Signal>),
 ) -> Result<Outcome> {
     let forwarded: &[Signal] = match mode {
         // A terminal sends SIGINT and SIGQUIT to the whole foreground process group, so the
@@ -455,6 +471,7 @@ fn watch_setup_process(
         Mode::Create => &TERMINATION_SIGNALS,
     };
     let mut created = Some(created);
+    let mut cancelled = None;
     loop {
         let event = match &created {
             Some(pipe) => signals.wait_or_readable(&[pipe.as_fd()]),
@@ -467,8 +484,8 @@ fn watch_setup_process(
                 if let Some(pipe) = created.take()
                     && ipc::read_ready(&pipe, "created")?
                 {
-                    on_created();
-                    if mode == Mode::Create {
+                    on_created(cancelled);
+                    if mode == Mode::Create && cancelled.is_none() {
                         return Ok(Outcome::Created);
                     }
                 }
@@ -492,15 +509,23 @@ fn watch_setup_process(
                 // example when `aj start` runs a short program at once. The created container
                 // stays until it is deleted, as OCI requires.
                 if mode == Mode::Create
+                    && cancelled.is_none()
                     && let Some(pipe) = created.take()
                     && ipc::has_signaled(&pipe, "created")?
                 {
                     return Ok(Outcome::Created);
                 }
-                return Ok(Outcome::Exited(exit_status(status)?));
+                let code = match cancelled {
+                    Some(signal) => 128 + signal as u8,
+                    None => exit_status(status)?,
+                };
+                return Ok(Outcome::Exited(code));
             }
             signal if forwarded.contains(&signal) => {
                 let _ = kill(child, signal);
+                if mode == Mode::Create {
+                    cancelled.get_or_insert(signal);
+                }
             }
             _ => {}
         }
@@ -748,7 +773,8 @@ fn exit_status(status: WaitStatus) -> Result<u8> {
 mod tests {
     use super::*;
     use nix::libc;
-    use nix::sys::signal::raise;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    use nix::sys::signal::{SigSet, raise};
     use nix::unistd::pipe;
 
     /// Fork a setup process that reports that the container is created and then runs `then`.
@@ -780,9 +806,28 @@ mod tests {
         let (child, created) = report_created(|| {});
         report_end(child);
 
-        let outcome = watch_setup_process(child, &signals, created, Mode::Create, || {});
+        let outcome = watch_setup_process(child, &signals, created, Mode::Create, |_| {});
 
         assert!(matches!(outcome.unwrap(), Outcome::Created));
+    }
+
+    #[test]
+    fn a_termination_signal_cancels_create() {
+        let signals = RuntimeSignals::block().unwrap();
+        // The setup process inherits the blocked signals, so it waits for the forwarded one.
+        let (child, created) = report_created(|| {
+            let _ = SigSet::from(Signal::SIGINT).wait();
+        });
+        // Ctrl-C comes right after the report, before the runtime reads it.
+        raise(Signal::SIGINT).unwrap();
+        let mut report = [PollFd::new(created.as_fd(), PollFlags::POLLIN)];
+        poll(&mut report, PollTimeout::NONE).unwrap();
+
+        let outcome = watch_setup_process(child, &signals, created, Mode::Create, |_| {
+            report_end(child)
+        });
+
+        assert!(matches!(outcome.unwrap(), Outcome::Exited(130)));
     }
 
     #[test]
