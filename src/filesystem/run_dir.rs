@@ -1,11 +1,17 @@
+use crate::cgroups;
 use crate::container_id::ContainerId;
 use crate::flock::{LockKind, lock, try_lock};
 use crate::paths;
 use crate::user::{Mapping, run_in_user_namespace};
 use anyhow::{Context, Result, bail};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+
+/// The file in a run directory that holds the path of the container cgroup.
+const CGROUP_FILE: &str = "cgroup";
 
 /// The directories that one run uses for its overlay root filesystem.
 ///
@@ -15,16 +21,17 @@ pub struct RunDir {
     // An exclusive flock on the directory shows that the run is alive. The forked processes
     // share this open file, and the kernel releases the lock when the last of them closes it or
     // ends, even when they are killed. `remove_stale` removes only directories whose lock is free.
-    _lock: File,
+    _lock: Option<File>,
 }
 
 impl RunDir {
-    /// Create the run directory of container `id` under `$XDG_DATA_HOME/agent-jail/runs`.
-    pub fn create(id: &ContainerId) -> Result<Self> {
-        Self::create_in(&runs_dir()?, id)
+    /// Create the run directory of container `id`, whose cgroup is `cgroup`, under
+    /// `$XDG_DATA_HOME/agent-jail/runs`.
+    pub fn create(id: &ContainerId, cgroup: &Path) -> Result<Self> {
+        Self::create_in(&runs_dir()?, id, cgroup)
     }
 
-    fn create_in(runs: &Path, id: &ContainerId) -> Result<Self> {
+    fn create_in(runs: &Path, id: &ContainerId, cgroup: &Path) -> Result<Self> {
         fs::create_dir_all(runs).with_context(|| format!("create {runs:?}"))?;
         // `remove_stale` locks `runs` exclusively, so it never finds the new directory in the
         // short time before the directory is locked.
@@ -43,11 +50,23 @@ impl RunDir {
             .with_context(|| format!("lock {path:?}"))?
             .with_context(|| format!("another process holds the lock of {path:?}"))?;
 
-        let run_dir = Self { path, _lock: lock };
+        let run_dir = Self {
+            path,
+            _lock: Some(lock),
+        };
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             fs::create_dir(&dir).with_context(|| format!("create {dir:?}"))?;
         }
+        let file = run_dir.path.join(CGROUP_FILE);
+        fs::write(&file, cgroup.as_os_str().as_bytes())
+            .with_context(|| format!("write {file:?}"))?;
         Ok(run_dir)
+    }
+
+    /// Close the lock in this process, which is no runtime process: container init before it
+    /// executes the program.
+    pub fn close_lock(&mut self) {
+        self._lock = None;
     }
 
     /// The overlay's upper directory, which receives every change in the container.
@@ -76,23 +95,55 @@ impl RunDir {
 
 /// Remove the run directories that no live run holds. A run that is killed, for example with
 /// SIGKILL, cannot remove its own directory.
+///
+/// Processes of the container may still use such a directory. They are ended first, because no
+/// runtime process is left to wait for them or to clean up after them.
 pub fn remove_stale(mapping: &Mapping) -> Result<()> {
     let Some(stale) = find_stale(&runs_dir()?)? else {
         return Ok(());
     };
-    if stale.dirs.is_empty() {
-        return Ok(());
+    let mut result = Ok(());
+    let mut ended = Vec::new();
+    for (path, _lock) in &stale.dirs {
+        match end_container(path) {
+            Ok(()) => ended.push(path),
+            // The directory stays, because processes that did not end still use its overlay.
+            Err(error) => result = Err(error),
+        }
+    }
+    if ended.is_empty() {
+        return result;
     }
     run_in_user_namespace(mapping, || {
         let mut result = Ok(());
         // The locks stay held until the removal ends, so another runtime skips these directories.
-        for (path, _lock) in &stale.dirs {
+        for path in ended {
             if let Err(error) = remove_dir(path) {
                 result = Err(error);
             }
         }
         result
-    })
+    })?;
+    result
+}
+
+/// End the processes of the container whose run directory is `dir`.
+///
+/// Container init ends when its setup process ends, unless the program clears its parent death
+/// signal, for example by changing its user or by running a set-user-ID program.
+fn end_container(dir: &Path) -> Result<()> {
+    let file = dir.join(CGROUP_FILE);
+    let cgroup = match fs::read(&file) {
+        // A run writes the file before it starts any process in the container.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        result => PathBuf::from(OsString::from_vec(
+            result.with_context(|| format!("read {file:?}"))?,
+        )),
+    };
+    if !cgroups::holds_processes(&cgroup)? {
+        return Ok(());
+    }
+    cgroups::kill_all(&cgroup).with_context(|| format!("end the container of {dir:?}"))
 }
 
 /// The run directories that a cleanup found, with the locks that it holds until it ends.
@@ -193,11 +244,16 @@ mod tests {
     fn creates_and_removes_the_overlay_directories() {
         let runs = TempRuns::new();
         let id = ContainerId::generate();
-        let run_dir = RunDir::create_in(&runs.0, &id).unwrap();
+        let cgroup = Path::new("/sys/fs/cgroup/app.slice/jail_x");
+        let run_dir = RunDir::create_in(&runs.0, &id, cgroup).unwrap();
         assert_eq!(run_dir.path, runs.0.join(id.as_str()));
         for dir in [run_dir.upper(), run_dir.work(), run_dir.merged()] {
             assert!(dir.is_dir(), "{dir:?} is missing");
         }
+        assert_eq!(
+            fs::read_to_string(run_dir.path.join(CGROUP_FILE)).unwrap(),
+            cgroup.to_str().unwrap()
+        );
 
         run_dir.remove().unwrap();
         assert!(!run_dir.path.exists());
@@ -208,8 +264,12 @@ mod tests {
     #[test]
     fn finds_only_run_directories_that_no_run_holds() {
         let runs = TempRuns::new();
-        let live =
-            RunDir::create_in(&runs.0, &ContainerId::parse("aaaaaaaaaaaaaaaa").unwrap()).unwrap();
+        let live = RunDir::create_in(
+            &runs.0,
+            &ContainerId::parse("aaaaaaaaaaaaaaaa").unwrap(),
+            Path::new("/no/cgroup"),
+        )
+        .unwrap();
         fs::create_dir(runs.0.join("bbbbbbbbbbbbbbbb")).unwrap();
         fs::write(runs.0.join("note"), "").unwrap();
 
@@ -225,6 +285,26 @@ mod tests {
             TempRuns::names(&stale.dirs),
             ["aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb"]
         );
+    }
+
+    #[test]
+    fn ends_only_a_container_whose_cgroup_holds_processes() {
+        let runs = TempRuns::new();
+        let dir = runs.0.join("box");
+        fs::create_dir_all(&dir).unwrap();
+        // A run that was killed before it wrote the file.
+        end_container(&dir).unwrap();
+
+        let cgroup = runs.0.join("jail_box");
+        fs::create_dir(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.kill"), "").unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 0\n").unwrap();
+        fs::write(dir.join(CGROUP_FILE), cgroup.to_str().unwrap()).unwrap();
+        end_container(&dir).unwrap();
+        assert_eq!(fs::read_to_string(cgroup.join("cgroup.kill")).unwrap(), "");
+
+        fs::remove_dir_all(&cgroup).unwrap();
+        end_container(&dir).unwrap();
     }
 
     #[test]

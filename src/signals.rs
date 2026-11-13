@@ -8,7 +8,7 @@ use std::fs;
 use std::os::fd::{AsFd, BorrowedFd};
 
 /// Signals that a terminal, a process manager, or a user sends to end a program.
-const TERMINATION_SIGNALS: [Signal; 4] = [
+pub const TERMINATION_SIGNALS: [Signal; 4] = [
     Signal::SIGHUP,
     Signal::SIGINT,
     Signal::SIGQUIT,
@@ -42,30 +42,35 @@ impl RuntimeSignals {
         self.set.wait().context("wait for a signal")
     }
 
-    /// Wait until one of the blocked signals arrives, or `fd` has data or reaches its end.
-    pub fn wait_or_readable(&self, fd: BorrowedFd) -> Result<Event> {
+    /// Wait until one of the blocked signals arrives, or one of `fds` has data or reaches its
+    /// end.
+    pub fn wait_or_readable(&self, fds: &[BorrowedFd]) -> Result<Event> {
         // A signalfd also reports the signals that were pending before it was created.
         let signal_fd =
             SignalFd::with_flags(&self.set, SfdFlags::SFD_CLOEXEC | SfdFlags::SFD_NONBLOCK)
                 .context("create a signalfd")?;
         loop {
-            let mut fds = [
-                PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN),
-                PollFd::new(fd, PollFlags::POLLIN),
-            ];
-            match poll(&mut fds, PollTimeout::NONE) {
+            let mut polled: Vec<PollFd> = std::iter::once(signal_fd.as_fd())
+                .chain(fds.iter().copied())
+                .map(|fd| PollFd::new(fd, PollFlags::POLLIN))
+                .collect();
+            match poll(&mut polled, PollTimeout::NONE) {
                 Err(Errno::EINTR) => continue,
                 result => result.context("poll")?,
             };
             // A closed write end shows as POLLHUP instead of POLLIN.
-            let [signal_ready, fd_ready] =
-                fds.map(|fd| fd.revents().is_some_and(|events| !events.is_empty()));
-            if signal_ready && let Some(info) = signal_fd.read_signal().context("read a signal")? {
+            let ready: Vec<bool> = polled
+                .iter()
+                .map(|fd| fd.revents().is_some_and(|events| !events.is_empty()))
+                .collect();
+            if ready[0]
+                && let Some(info) = signal_fd.read_signal().context("read a signal")?
+            {
                 let signal = Signal::try_from(info.ssi_signo as i32).context("read a signal")?;
                 return Ok(Event::Signal(signal));
             }
-            if fd_ready {
-                return Ok(Event::Readable);
+            if let Some(index) = ready[1..].iter().position(|&ready| ready) {
+                return Ok(Event::Readable(index));
             }
         }
     }
@@ -75,8 +80,8 @@ impl RuntimeSignals {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Event {
     Signal(Signal),
-    /// The file has data, or its write end was closed.
-    Readable,
+    /// The file at this index has data, or its write end was closed.
+    Readable(usize),
 }
 
 /// Give the program the signal state that a new process normally has.
@@ -122,6 +127,18 @@ fn signal_mask(status: &str, field: &str) -> Result<u64> {
 mod tests {
     use super::*;
 
+    /// Like `RuntimeSignals::wait_or_readable`, but skip SIGCHLD. The children of other tests
+    /// send it to the whole test process. While this thread blocks it, it can stay pending for
+    /// the process, and this thread reads those pending signals, too.
+    fn next_event(signals: &RuntimeSignals, fds: &[BorrowedFd]) -> Event {
+        loop {
+            match signals.wait_or_readable(fds).unwrap() {
+                Event::Signal(Signal::SIGCHLD) => continue,
+                event => return event,
+            }
+        }
+    }
+
     fn status(ignored: &str, caught: &str) -> String {
         format!("Name:\tsh\nSigBlk:\t0000000000000000\nSigIgn:\t{ignored}\nSigCgt:\t{caught}\n")
     }
@@ -147,14 +164,24 @@ mod tests {
         // raise sends the signal to this thread, which blocks it, so it stays pending.
         nix::sys::signal::raise(Signal::SIGTERM).unwrap();
         assert_eq!(
-            signals.wait_or_readable(reader.as_fd()).unwrap(),
+            next_event(&signals, &[reader.as_fd()]),
             Event::Signal(Signal::SIGTERM)
         );
 
         drop(writer);
+        assert_eq!(next_event(&signals, &[reader.as_fd()]), Event::Readable(0));
+    }
+
+    #[test]
+    fn reports_which_descriptor_is_readable() {
+        let signals = RuntimeSignals::block().unwrap();
+        let (quiet, _quiet_writer) = nix::unistd::pipe().unwrap();
+        let (readable, writer) = nix::unistd::pipe().unwrap();
+        nix::unistd::write(&writer, b"x").unwrap();
+
         assert_eq!(
-            signals.wait_or_readable(reader.as_fd()).unwrap(),
-            Event::Readable
+            next_event(&signals, &[quiet.as_fd(), readable.as_fd()]),
+            Event::Readable(1)
         );
     }
 

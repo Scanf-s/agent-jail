@@ -28,8 +28,8 @@ pub struct StateDir {
     keep: bool,
     // An exclusive flock shows that a runtime process of the container is alive, as for the
     // run directory. The forked processes share this open file, and the kernel releases the
-    // lock when the last of them ends, even when they are killed.
-    _lock: File,
+    // lock when the last of them closes it or ends, even when they are killed.
+    lock: Option<File>,
 }
 
 impl StateDir {
@@ -66,7 +66,7 @@ impl StateDir {
             record,
             owner: Pid::this(),
             keep: false,
-            _lock: lock,
+            lock: Some(lock),
         };
         dir.write()?;
 
@@ -77,6 +77,25 @@ impl StateDir {
         }
         dir.path = path;
         Ok(dir)
+    }
+
+    /// Close the lock in this process, which is no runtime process: container init before it
+    /// executes the program.
+    pub fn close_lock(&mut self) {
+        self.lock = None;
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The address of the socket `name` in the directory.
+    pub fn socket_address(&self, name: &str) -> Result<PathBuf> {
+        let dir = self
+            .lock
+            .as_ref()
+            .context("this process closed the state directory")?;
+        Ok(super::socket_address(dir, name))
     }
 
     /// Leave the directory in place when this is dropped.

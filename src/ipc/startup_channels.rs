@@ -1,6 +1,7 @@
 use super::{ChildChannels, ParentChannels};
 use anyhow::{Context, Result};
-use nix::unistd::pipe;
+use nix::fcntl::OFlag;
+use nix::unistd::pipe2;
 use std::os::fd::OwnedFd;
 
 pub(crate) struct StartupChannels {
@@ -9,16 +10,18 @@ pub(crate) struct StartupChannels {
     mapping: (OwnedFd, OwnedFd),
     network_namespace: (OwnedFd, OwnedFd),
     network: (OwnedFd, OwnedFd),
+    created: (OwnedFd, OwnedFd),
 }
 
 impl StartupChannels {
     pub(crate) fn new() -> Result<Self> {
         Ok(Self {
-            cgroup: pipe().context("create cgroup pipe")?,
-            user_namespace: pipe().context("create user namespace pipe")?,
-            mapping: pipe().context("create mapping pipe")?,
-            network_namespace: pipe().context("create network namespace pipe")?,
-            network: pipe().context("create network pipe")?,
+            cgroup: pipe("cgroup")?,
+            user_namespace: pipe("user namespace")?,
+            mapping: pipe("mapping")?,
+            network_namespace: pipe("network namespace")?,
+            network: pipe("network")?,
+            created: pipe("created")?,
         })
     }
 
@@ -29,6 +32,7 @@ impl StartupChannels {
         let (mapping_reader, mapping_writer) = self.mapping;
         let (network_namespace_reader, network_namespace_writer) = self.network_namespace;
         let (network_reader, network_writer) = self.network;
+        let (created_reader, created_writer) = self.created;
 
         // close the ends used only by the child.
         drop((
@@ -37,6 +41,7 @@ impl StartupChannels {
             mapping_reader,
             network_namespace_writer,
             network_reader,
+            created_writer,
         ));
 
         ParentChannels::new(
@@ -45,6 +50,7 @@ impl StartupChannels {
             mapping_writer,
             network_namespace_reader,
             network_writer,
+            created_reader,
         )
     }
 
@@ -55,6 +61,7 @@ impl StartupChannels {
         let (mapping_reader, mapping_writer) = self.mapping;
         let (network_namespace_reader, network_namespace_writer) = self.network_namespace;
         let (network_reader, network_writer) = self.network;
+        let (created_reader, created_writer) = self.created;
 
         // close the ends used only by the parent.
         drop((
@@ -63,6 +70,7 @@ impl StartupChannels {
             mapping_writer,
             network_namespace_reader,
             network_writer,
+            created_reader,
         ));
 
         ChildChannels::new(
@@ -71,6 +79,11 @@ impl StartupChannels {
             mapping_reader,
             network_namespace_writer,
             network_reader,
+            created_writer,
         )
     }
+}
+
+fn pipe(stage: &str) -> Result<(OwnedFd, OwnedFd)> {
+    pipe2(OFlag::O_CLOEXEC).with_context(|| format!("create {stage} pipe"))
 }

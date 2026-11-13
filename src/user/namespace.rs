@@ -26,7 +26,7 @@ pub fn run_in_user_namespace(mapping: &Mapping, task: impl FnOnce() -> Result<()
                 task()
             })();
             if let Err(error) = result {
-                eprintln!("aj: {error:#}");
+                report!("aj: {error:#}");
                 std::process::exit(1);
             }
             std::process::exit(0);

@@ -41,14 +41,14 @@ pub fn list(root: &Path) -> Result<Vec<Record>> {
             Ok(true) if is_id => {}
             Ok(_) => continue,
             Err(error) => {
-                eprintln!("aj: warning: read {dir:?}: {error}");
+                report!("aj: warning: read {dir:?}: {error}");
                 continue;
             }
         }
         match Record::load(&dir).and_then(|record| with_current_status(&dir, record)) {
             Ok(record) => records.push(record),
             Err(error) if is_not_found(&error) => {}
-            Err(error) => eprintln!("aj: warning: {error:#}"),
+            Err(error) => report!("aj: warning: {error:#}"),
         }
     }
     records.sort_by(|a, b| (a.created, a.oci.id()).cmp(&(b.created, b.oci.id())));
@@ -85,8 +85,11 @@ fn current_status(recorded: ContainerState, init_runs: bool, lock_held: bool) ->
     match recorded {
         // The record names no init yet, so only the runtime processes show that it is alive.
         ContainerState::Creating if lock_held => ContainerState::Creating,
+        // Init waits for its setup process to start the program, and fails when that process
+        // ends. Until then, the container cannot start.
+        ContainerState::Created if init_runs && lock_held => ContainerState::Created,
         // Once init has ended, the program has ended, even if the runtime still cleans up.
-        ContainerState::Created | ContainerState::Running if init_runs => recorded,
+        ContainerState::Running if init_runs => ContainerState::Running,
         _ => ContainerState::Stopped,
     }
 }
@@ -216,7 +219,8 @@ mod tests {
         let cases = [
             (Creating, false, true, Creating),
             (Creating, false, false, Stopped),
-            (Created, true, false, Created),
+            (Created, true, true, Created),
+            (Created, true, false, Stopped),
             (Created, false, true, Stopped),
             (Running, true, true, Running),
             (Running, true, false, Running),
