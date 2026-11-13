@@ -127,6 +127,18 @@ fn signal_mask(status: &str, field: &str) -> Result<u64> {
 mod tests {
     use super::*;
 
+    /// Like `RuntimeSignals::wait_or_readable`, but skip SIGCHLD. The children of other tests
+    /// send it to the whole test process. While this thread blocks it, it can stay pending for
+    /// the process, and this thread reads those pending signals, too.
+    fn next_event(signals: &RuntimeSignals, fds: &[BorrowedFd]) -> Event {
+        loop {
+            match signals.wait_or_readable(fds).unwrap() {
+                Event::Signal(Signal::SIGCHLD) => continue,
+                event => return event,
+            }
+        }
+    }
+
     fn status(ignored: &str, caught: &str) -> String {
         format!("Name:\tsh\nSigBlk:\t0000000000000000\nSigIgn:\t{ignored}\nSigCgt:\t{caught}\n")
     }
@@ -152,15 +164,12 @@ mod tests {
         // raise sends the signal to this thread, which blocks it, so it stays pending.
         nix::sys::signal::raise(Signal::SIGTERM).unwrap();
         assert_eq!(
-            signals.wait_or_readable(&[reader.as_fd()]).unwrap(),
+            next_event(&signals, &[reader.as_fd()]),
             Event::Signal(Signal::SIGTERM)
         );
 
         drop(writer);
-        assert_eq!(
-            signals.wait_or_readable(&[reader.as_fd()]).unwrap(),
-            Event::Readable(0)
-        );
+        assert_eq!(next_event(&signals, &[reader.as_fd()]), Event::Readable(0));
     }
 
     #[test]
@@ -171,9 +180,7 @@ mod tests {
         nix::unistd::write(&writer, b"x").unwrap();
 
         assert_eq!(
-            signals
-                .wait_or_readable(&[quiet.as_fd(), readable.as_fd()])
-                .unwrap(),
+            next_event(&signals, &[quiet.as_fd(), readable.as_fd()]),
             Event::Readable(1)
         );
     }
