@@ -75,7 +75,7 @@ impl Record {
         serde_json::from_slice(&json).with_context(|| format!("parse {path:?}"))
     }
 
-    /// Whether container init still runs. Before init runs the program, the record names no
+    /// Whether container init still runs. Until the container is created, the record names no
     /// init, so this returns false.
     pub fn init_runs(&self) -> Result<bool> {
         match (self.oci.pid(), self.init_start_time) {
