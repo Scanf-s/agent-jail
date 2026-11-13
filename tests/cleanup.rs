@@ -77,8 +77,8 @@ fn state_and_list_report_a_running_and_a_killed_container() {
     // A killed runtime leaves running in the state file.
     kill_group(&mut aj);
 
-    let state: Value = serde_json::from_slice(&sandbox.aj(&["state", "box"]).stdout).unwrap();
-    assert_eq!(state["status"], "stopped");
+    // Right after SIGKILL, init can still be exiting, and then it still counts as running.
+    let state = sandbox.wait_for_status("box", "stopped");
     assert_eq!(state.get("pid"), None);
     let list = String::from_utf8(sandbox.aj(&["list"]).stdout).unwrap();
     assert!(
