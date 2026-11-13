@@ -7,6 +7,7 @@
 use crate::container_id::ContainerId;
 use crate::state::{self, StateDir};
 use anyhow::{Context, Result, anyhow, bail};
+use nix::unistd::Pid;
 use oci_spec::runtime::ContainerState;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -21,10 +22,13 @@ const REQUEST: &[u8] = b"start\n";
 /// because the program can be slow to execute, for example from a network file system.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The socket of the setup process.
+/// The socket of the setup process. Dropping it in the process that created it removes it.
 pub struct StartSocket {
     listener: UnixListener,
     path: PathBuf,
+    /// The setup process. Container init has a copy after fork, and must not remove the
+    /// socket when it drops that copy.
+    owner: Pid,
 }
 
 impl StartSocket {
@@ -35,6 +39,7 @@ impl StartSocket {
         Ok(Self {
             listener,
             path: state_dir.path().join(SOCKET),
+            owner: Pid::this(),
         })
     }
 
@@ -69,8 +74,17 @@ impl StartSocket {
 
     /// Stop listening, so that a later request fails at once.
     pub fn close(self) {
-        drop(self.listener);
-        let _ = fs::remove_file(&self.path);
+        drop(self);
+    }
+}
+
+impl Drop for StartSocket {
+    fn drop(&mut self) {
+        // A container that ends before it starts keeps its state until it is deleted, and the
+        // socket would stay in it without a listener.
+        if Pid::this() == self.owner {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -182,19 +196,17 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("aj-start-{:x}.sock", random::<u64>()));
             let listener = UnixListener::bind(&path).unwrap();
-            Self(StartSocket { listener, path })
+            Self(StartSocket {
+                listener,
+                path,
+                owner: Pid::this(),
+            })
         }
 
         fn send(&self, request: &[u8]) -> UnixStream {
             let mut client = UnixStream::connect(&self.0.path).unwrap();
             client.write_all(request).unwrap();
             client
-        }
-    }
-
-    impl Drop for TempSocket {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0.path);
         }
     }
 
@@ -230,6 +242,23 @@ mod tests {
 
         assert_eq!(answer_of(client), "error exec failed\n");
         assert_eq!(answer_of(failed), "error the program did not start\n");
+    }
+
+    #[test]
+    fn removes_the_socket_only_in_its_owner() {
+        let socket = TempSocket::new();
+        let path = socket.0.path.clone();
+        let mut copy = TempSocket::new();
+        // Like the copy of container init after fork.
+        copy.0.owner = Pid::from_raw(0);
+        let copy_path = copy.0.path.clone();
+
+        drop(socket);
+        drop(copy);
+
+        assert!(!path.exists());
+        assert!(copy_path.exists());
+        fs::remove_file(copy_path).unwrap();
     }
 
     #[test]

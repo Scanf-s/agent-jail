@@ -99,6 +99,7 @@ fn a_created_container_stays_after_its_program_ended() {
     let bundle = sandbox.bundle(&PROGRAM, "/");
     assert!(sandbox.create(&bundle, "box").status.success());
     let init = init_of(&sandbox.state("box"));
+    let setup = parent_of(init);
 
     kill(init, Signal::SIGKILL).unwrap();
 
@@ -111,12 +112,15 @@ fn a_created_container_stays_after_its_program_ended() {
     let states = sandbox.states();
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["autoDelete"], false);
-    // The setup process removes the run directory when init ends.
-    let deadline = Instant::now() + TIMEOUT;
-    while sandbox.run_dirs() != 0 {
-        assert!(Instant::now() < deadline, "the run directory stays");
-        sleep(Duration::from_millis(20));
-    }
+    // The setup process removes the run directory and its socket when init ends.
+    wait_until_ended(setup);
+    assert_eq!(sandbox.run_dirs(), 0);
+    let mut kept: Vec<_> = fs::read_dir(sandbox.root.join("state/box"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["state.json"]);
 }
 
 #[test]
