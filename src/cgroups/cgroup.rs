@@ -73,9 +73,17 @@ pub fn check_delegated(dir: &Path, runtime: Pid) -> Result<()> {
 /// exist holds none.
 pub fn holds_processes(path: &Path) -> Result<bool> {
     match fs::read_to_string(path.join("cgroup.events")) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if is_removed(&error) => Ok(false),
         result => is_populated(&result.with_context(|| format!("read {path:?}/cgroup.events"))?),
     }
+}
+
+/// Whether `error` comes from a cgroup that does not exist.
+///
+/// systemd removes the scope and its cgroups when their last process ends. A file of a cgroup
+/// that is removed between its open and its read or write fails with ENODEV, not NotFound.
+fn is_removed(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(Errno::ENODEV as i32)
 }
 
 /// Whether `cgroup.events` reports a process in the cgroup or in one of its descendants.
@@ -122,12 +130,14 @@ fn write_kill_file(path: &Path) -> Result<bool> {
     // Without `create`, a missing file fails with NotFound instead of being created.
     match OpenOptions::new().write(true).open(&file) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        result => {
-            result
-                .and_then(|mut opened| opened.write_all(b"1"))
-                .with_context(|| format!("write {file:?}"))?;
-            Ok(true)
-        }
+        result => match result.and_then(|mut opened| opened.write_all(b"1")) {
+            // The cgroup was removed after the open, so it holds no process to kill.
+            Err(error) if is_removed(&error) => Ok(true),
+            result => {
+                result.with_context(|| format!("write {file:?}"))?;
+                Ok(true)
+            }
+        },
     }
 }
 
@@ -135,7 +145,7 @@ fn write_kill_file(path: &Path) -> Result<bool> {
 fn kill_listed_processes(dir: &Path) -> Result<()> {
     let procs = match fs::read_to_string(dir.join("cgroup.procs")) {
         // A descendant cgroup can be removed while this walks the tree.
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if is_removed(&error) => return Ok(()),
         result => result.with_context(|| format!("read {dir:?}/cgroup.procs"))?,
     };
     for pid in procs.split_whitespace() {
@@ -495,6 +505,18 @@ mod tests {
         assert!(!is_populated("populated 0\nfrozen 0\n").unwrap());
         assert!(is_populated("frozen 0\n").is_err());
         assert!(is_populated("populated x\n").is_err());
+    }
+
+    #[test]
+    fn treats_a_removed_cgroup_as_gone() {
+        assert!(is_removed(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(is_removed(&io::Error::from_raw_os_error(
+            Errno::ENODEV as i32
+        )));
+        assert!(!is_removed(&io::Error::from_raw_os_error(
+            Errno::EACCES as i32
+        )));
+        assert!(!holds_processes(Path::new("/sys/fs/cgroup/no/such/cgroup")).unwrap());
     }
 
     #[test]
