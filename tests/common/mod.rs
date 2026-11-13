@@ -128,11 +128,22 @@ impl Sandbox {
     /// The container program keeps the standard streams of `aj create`. A pipe would reach EOF
     /// only when the program ends, so the streams go to files in the sandbox.
     pub fn create(&self, bundle: &Path, id: &str) -> Created {
+        self.create_with(bundle, id, |_| {})
+    }
+
+    /// Like `create`, but let `configure` change the command first.
+    pub fn create_with(
+        &self,
+        bundle: &Path,
+        id: &str,
+        configure: impl FnOnce(&mut Command),
+    ) -> Created {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let name = format!("create-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         let stdout = self.root.join(format!("{name}.stdout"));
         let stderr = self.root.join(format!("{name}.stderr"));
-        let mut aj = Command::new(env!("CARGO_BIN_EXE_aj"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_aj"));
+        command
             .env("XDG_DATA_HOME", self.root.join("data"))
             .arg("--root")
             .arg(self.root.join("state"))
@@ -142,9 +153,9 @@ impl Sandbox {
             .arg(id)
             .stdin(Stdio::null())
             .stdout(File::create(&stdout).unwrap())
-            .stderr(File::create(&stderr).unwrap())
-            .spawn()
-            .unwrap();
+            .stderr(File::create(&stderr).unwrap());
+        configure(&mut command);
+        let mut aj = command.spawn().unwrap();
         let status = wait(&mut aj);
         Created {
             status,

@@ -10,7 +10,9 @@ use common::*;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getsid};
 use serde_json::Value;
-use std::fs;
+use std::fs::{self, File};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -51,6 +53,40 @@ fn create_prepares_the_container_without_running_its_program() {
     assert!(list.lines().nth(1).unwrap().contains(" created "), "{list}");
     sleep(Duration::from_millis(200));
     assert_eq!(fs::read_to_string(&created.stdout).unwrap(), "");
+
+    kill(init, Signal::SIGKILL).unwrap();
+    wait_until_ended(init);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn the_setup_process_keeps_no_descriptor_of_the_caller() {
+    let sandbox = Sandbox::new("create-fds");
+    let bundle = sandbox.bundle(&PROGRAM, "/");
+    // A kept descriptor could, for example, hold a file lock of the caller until the container
+    // ends.
+    let inherited = sandbox.root.join("inherited");
+    let file = File::create(&inherited).unwrap();
+    let fd = file.as_raw_fd();
+
+    let created = sandbox.create_with(&bundle, "box", |command| {
+        // SAFETY: dup2 is async-signal-safe.
+        unsafe {
+            command.pre_exec(move || {
+                nix::unistd::dup2(fd, 9)?;
+                Ok(())
+            });
+        }
+    });
+
+    assert!(created.status.success(), "{}", created.stderr);
+    let init = init_of(&sandbox.state("box"));
+    let setup = parent_of(init);
+    let kept: Vec<_> = fs::read_dir(format!("/proc/{setup}/fd"))
+        .unwrap()
+        .filter_map(|entry| fs::read_link(entry.unwrap().path()).ok())
+        .collect();
+    assert!(!kept.contains(&inherited), "{kept:?}");
 
     kill(init, Signal::SIGKILL).unwrap();
     wait_until_ended(init);

@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod container;
 mod container_id;
+mod descriptors;
 mod filesystem;
 mod flock;
 mod ipc;
@@ -26,6 +27,7 @@ mod user;
 
 #[cfg(target_os = "linux")]
 fn main() -> Result<ExitCode> {
+    descriptors::close_inherited().context("close the descriptors of the caller")?;
     let cli = cli::Cli::parse();
 
     // The cgroup setup needs a cgroup that systemd delegates to a normal user.
