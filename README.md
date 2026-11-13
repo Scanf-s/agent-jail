@@ -102,8 +102,8 @@ aj state build
 
 The state of each container is stored in `$XDG_RUNTIME_DIR/agent-jail`. `aj run` removes it when the program ends.
 Use `aj --root DIRECTORY` to store it in another directory.
-If `aj` is killed, its container ends too, and `aj list` shows it as `stopped`.
-A program that changes its user, for example with `su`, can keep running.
+If `aj` is killed, its container ends too.
+`aj` runs as two processes. If both are killed, for example with `pkill -9 aj`, `aj list` shows the container as `stopped`, and a program that changes its user, for example with `su`, can keep running.
 The next `aj run` or `aj create` ends such a program and removes what the killed run left behind.
 
 ## OCI bundles

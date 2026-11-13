@@ -4,23 +4,24 @@ use crate::container;
 use crate::filesystem::{PivotRoot, RunDir};
 use crate::ipc::{self, ChildChannels, StartupChannels};
 use crate::network;
+use crate::pidfd;
 use crate::proc_stat;
 use crate::signals::{self, Event, RuntimeSignals, TERMINATION_SIGNALS};
 use crate::state::{Record, StateDir};
 use crate::user::Mapping;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
 use nix::unistd::{
-    ForkResult, Gid, Pid, Uid, chdir, dup2, fork, setgid, setgroups, setsid, setuid,
+    ForkResult, Gid, Pid, Uid, chdir, dup2, fork, getppid, setgid, setgroups, setsid, setuid,
 };
 use oci_spec::runtime::ContainerState;
 use start::{StartRequest, StartSocket};
 use startup::Report;
 use std::fs::OpenOptions;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::ExitCode;
@@ -101,9 +102,10 @@ impl Runtime {
 
     fn launch(mut self, mode: Mode) -> Result<ExitCode> {
         let signals = RuntimeSignals::block()?;
+        let runtime = Pid::this();
         match unsafe { fork() }.context("fork failed")? {
             ForkResult::Parent { child } => self.run_parent(child, &signals, mode),
-            ForkResult::Child => self.run_setup_process(&signals, mode),
+            ForkResult::Child => self.run_setup_process(&signals, mode, runtime),
         }
     }
 
@@ -218,21 +220,27 @@ impl Runtime {
         ipc.take_created_reader()
     }
 
-    fn run_setup_process(&mut self, signals: &RuntimeSignals, mode: Mode) -> ! {
-        if let Err(error) = self.setup_process(signals, mode) {
+    /// Run the setup process, a child of the runtime process `runtime`.
+    fn run_setup_process(&mut self, signals: &RuntimeSignals, mode: Mode, runtime: Pid) -> ! {
+        if let Err(error) = self.setup_process(signals, mode, runtime) {
             report!("aj: setup process failed: {error:#}");
             std::process::exit(127);
         }
         unreachable!("setup process returned without exiting");
     }
 
-    fn setup_process(&mut self, signals: &RuntimeSignals, mode: Mode) -> Result<()> {
-        if mode == Mode::Create {
+    fn setup_process(&mut self, signals: &RuntimeSignals, mode: Mode, runtime: Pid) -> Result<()> {
+        let runtime = match mode {
+            // The container of `aj run` ends with the run, also when its runtime is killed.
+            Mode::Run => Some(watch_runtime(runtime)?),
             // The container stays after `aj create` returns. In a session of its own, it does
             // not receive the signals of the caller's terminal, for example Ctrl-C for a later
             // command. Until then, the runtime passes those signals on.
-            setsid().context("create a session for the container")?;
-        }
+            Mode::Create => {
+                setsid().context("create a session for the container")?;
+                None
+            }
+        };
         let channels = self
             .channels
             .take()
@@ -253,14 +261,17 @@ impl Runtime {
         ipc.signal_network_namespace_ready()?;
         ipc.wait_for_network()?;
 
-        self.launch_init(signals, ipc, mode)
+        self.launch_init(signals, ipc, mode, runtime)
     }
 
+    /// Fork container init and supervise it. `runtime` is a pidfd of the runtime process of
+    /// `aj run`.
     fn launch_init(
         &mut self,
         signals: &RuntimeSignals,
         mut ipc: ChildChannels,
         mode: Mode,
+        runtime: Option<OwnedFd>,
     ) -> Result<()> {
         let (channel, init_channel) = startup::channel()?;
         let socket = match mode {
@@ -272,7 +283,7 @@ impl Runtime {
                 drop(init_channel);
                 // Whether `aj create` reported the container as created.
                 let mut reported = false;
-                let code = supervise(child, signals, channel, socket, |startup| match startup {
+                let on_startup = |startup: Startup| match startup {
                     // A created container must report the PID of init, so the program does
                     // not start without the record.
                     Startup::Created => {
@@ -308,25 +319,31 @@ impl Runtime {
                         report!("aj: container init failed: {message}");
                         Ok(())
                     }
-                });
+                };
+                let watched = runtime.as_ref().map(AsFd::as_fd);
+                let code = supervise(child, signals, channel, socket, watched, on_startup);
                 self.record_stopped(code.as_ref().ok().copied());
                 // Only a process in the user namespace can remove files of subordinate IDs.
                 // The overlay is already gone, because init's mount namespace ended with it.
                 if let Err(error) = self.run_dir.remove() {
                     report!("aj: warning: {error:#}");
                 }
-                // A failed `aj create` must leave no container, also when it ended before it
-                // could clean up.
-                if mode == Mode::Create
-                    && !reported
-                    && let Err(error) = self.state_dir.remove()
-                {
+                let abandoned = match mode {
+                    // Without its runtime, nothing else removes the state of `aj run`.
+                    Mode::Run => runtime
+                        .as_ref()
+                        .is_some_and(|runtime| pidfd::has_ended(runtime).unwrap_or(false)),
+                    // A failed `aj create` must leave no container, also when it ended before
+                    // it could clean up.
+                    Mode::Create => !reported,
+                };
+                if abandoned && let Err(error) = self.state_dir.remove() {
                     report!("aj: warning: {error:#}");
                 }
                 std::process::exit(i32::from(code?));
             }
             ForkResult::Child => {
-                drop((channel, ipc, socket));
+                drop((channel, ipc, socket, runtime));
                 // The locks show that a runtime process is alive. Init is not one, and it can
                 // wait for the start of the program for a long time.
                 self.state_dir.close_lock();
@@ -418,6 +435,15 @@ impl Runtime {
         signals::reset_for_exec()?;
         container::exec(&process.args, &process.env)
     }
+}
+
+/// Open a pidfd of `runtime`, the parent of this setup process.
+fn watch_runtime(runtime: Pid) -> Result<OwnedFd> {
+    let pidfd = pidfd::open(runtime)?;
+    // If the runtime ended before pidfd_open, another process may have its PID now. While the
+    // runtime lives, it stays the parent of this process.
+    ensure!(getppid() == runtime, "the runtime ended");
+    Ok(pidfd)
 }
 
 /// Let the setup process outlive `aj create`, which returns after this.
@@ -547,7 +573,7 @@ enum Startup {
 /// `channel` is the end of the startup channel that the setup process keeps. This passes what
 /// init does before its program runs to `on_startup`. After `on_startup` accepted
 /// `Startup::Created`, this starts the program: at once without `socket`, or when `aj start`
-/// asks on `socket`.
+/// asks on `socket`. When the process of the pidfd `runtime` ends, this ends init.
 ///
 /// If waiting fails, this kills and reaps init, so that the caller can remove the run directory.
 fn supervise(
@@ -555,9 +581,10 @@ fn supervise(
     signals: &RuntimeSignals,
     channel: UnixStream,
     socket: Option<StartSocket>,
+    runtime: Option<BorrowedFd>,
     on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
-    let result = wait_for_init(init, signals, channel, socket, on_startup);
+    let result = wait_for_init(init, signals, channel, socket, runtime, on_startup);
     if result.is_err() {
         let _ = kill(init, Signal::SIGKILL);
         let _ = waitpid(init, None);
@@ -565,11 +592,23 @@ fn supervise(
     result
 }
 
+/// What `wait_for_init` waits for, besides signals.
+#[derive(Clone, Copy)]
+enum Source {
+    /// The startup channel of init.
+    Channel,
+    /// The socket on which `aj start` asks for the start.
+    Socket,
+    /// The runtime process of `aj run`.
+    Runtime,
+}
+
 fn wait_for_init(
     init: Pid,
     signals: &RuntimeSignals,
     channel: UnixStream,
     mut socket: Option<StartSocket>,
+    mut runtime: Option<BorrowedFd>,
     mut on_startup: impl FnMut(Startup) -> Result<()>,
 ) -> Result<u8> {
     let start_at_once = socket.is_none();
@@ -583,13 +622,21 @@ fn wait_for_init(
     // The termination signal for which the runtime killed init.
     let mut termination_signal = None;
     loop {
+        // While the channel is open, it comes first.
+        let mut sources = Vec::new();
         let mut fds = Vec::new();
         if let Some(channel) = &channel {
+            sources.push(Source::Channel);
             fds.push(channel.as_fd());
         }
         // A request that comes earlier waits in the socket.
         if created && let Some(socket) = &socket {
+            sources.push(Source::Socket);
             fds.push(socket.as_fd());
+        }
+        if let Some(runtime) = runtime {
+            sources.push(Source::Runtime);
+            fds.push(runtime);
         }
         // While init starts, signals must still reach this loop. Otherwise Ctrl-C could not end
         // an init that hangs before exec.
@@ -598,10 +645,16 @@ fn wait_for_init(
         } else {
             signals.wait_or_readable(&fds)?
         };
+        drop(fds);
         let signal = match event {
             Event::Signal(signal) => signal,
-            // While the channel is open, it comes first.
-            Event::Readable(0) if channel.is_some() => {
+            Event::Readable(index) if matches!(sources[index], Source::Runtime) => {
+                // The runtime of `aj run` was killed, and the container must not outlive it.
+                runtime = None;
+                let _ = kill(init, Signal::SIGKILL);
+                continue;
+            }
+            Event::Readable(index) if matches!(sources[index], Source::Channel) => {
                 let Some(open) = &channel else {
                     continue;
                 };

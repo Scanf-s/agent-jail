@@ -75,8 +75,7 @@ fn state_and_list_report_a_running_and_a_killed_container() {
     assert!(list.lines().nth(1).unwrap().starts_with(&row), "{list}");
 
     // A killed runtime leaves running in the state file.
-    signal_group(&aj, Signal::SIGKILL);
-    wait(&mut aj);
+    kill_group(&mut aj);
 
     let state: Value = serde_json::from_slice(&sandbox.aj(&["state", "box"]).stdout).unwrap();
     assert_eq!(state["status"], "stopped");
@@ -333,12 +332,29 @@ fn container_init_ends_when_the_runtime_and_the_setup_process_are_killed() {
     let setup = only_child(Pid::from_raw(aj.id() as i32));
     let init = only_child(setup);
 
-    // Without the runtime, nothing writes cgroup.kill after the setup process ends.
-    kill(Pid::from_raw(aj.id() as i32), Signal::SIGKILL).unwrap();
-    wait(&mut aj);
-    kill(setup, Signal::SIGKILL).unwrap();
+    // Then only the parent death signal of init can end the container.
+    kill_runtime_processes(&mut aj, setup);
 
     wait_until_ended(init);
+}
+
+#[test]
+#[ignore = "starts a container"]
+fn the_setup_process_ends_the_container_when_only_the_runtime_is_killed() {
+    let sandbox = Sandbox::new("runtime-killed");
+    let mut aj = sandbox.spawn("touch /out/ready && exec sleep 60");
+    sandbox.wait_until_ready();
+    sandbox.wait_until_running();
+    let setup = only_child(Pid::from_raw(aj.id() as i32));
+    let init = only_child(setup);
+
+    kill(Pid::from_raw(aj.id() as i32), Signal::SIGKILL).unwrap();
+    wait(&mut aj);
+
+    wait_until_ended(init);
+    wait_until_ended(setup);
+    assert_eq!(sandbox.run_dirs(), 0);
+    assert_eq!(sandbox.states(), Vec::<Value>::new());
 }
 
 #[test]
@@ -358,9 +374,7 @@ fn the_next_run_ends_a_container_that_changed_its_user() {
         );
         sleep(Duration::from_millis(20));
     }
-    kill(Pid::from_raw(aj.id() as i32), Signal::SIGKILL).unwrap();
-    wait(&mut aj);
-    kill(setup, Signal::SIGKILL).unwrap();
+    kill_runtime_processes(&mut aj, setup);
     sleep(Duration::from_millis(200));
     assert!(
         is_running(init),
@@ -382,8 +396,7 @@ fn the_next_run_removes_what_a_killed_run_left() {
     let mut killed = sandbox.spawn(&format!("{CREATE_SUBORDINATE_FILE} && exec sleep 60"));
     sandbox.wait_until_ready();
     sandbox.wait_until_running();
-    signal_group(&killed, Signal::SIGKILL);
-    wait(&mut killed);
+    kill_group(&mut killed);
     assert_eq!(sandbox.run_dirs(), 1);
     let states = sandbox.states();
     assert_eq!(states.len(), 1, "{states:?}");
@@ -405,8 +418,7 @@ fn a_killed_run_does_not_keep_its_id_in_use() {
         &["/bin/sh", "-c", "touch /out/ready && exec sleep 60"],
     );
     sandbox.wait_until_ready();
-    signal_group(&killed, Signal::SIGKILL);
-    wait(&mut killed);
+    kill_group(&mut killed);
 
     let mut next = sandbox.spawn_with(&["--id", "box"], &["/bin/true"]);
 

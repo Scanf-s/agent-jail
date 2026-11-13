@@ -298,6 +298,28 @@ pub fn signal_group(child: &Child, signal: Signal) {
     kill(Pid::from_raw(-(child.id() as i32)), signal).unwrap();
 }
 
+/// Kill every process in the process group of `child` at once, and wait for `child`.
+///
+/// The processes stop first, so none of them can react to the end of another, as the setup
+/// process ends the container when the runtime ends.
+pub fn kill_group(child: &mut Child) {
+    signal_group(child, Signal::SIGSTOP);
+    signal_group(child, Signal::SIGKILL);
+    wait(child);
+}
+
+/// Kill the runtime `aj` and its setup process `setup` at once, and wait for the runtime.
+///
+/// The runtime stops first, so it cannot end the container when the setup process ends, and it
+/// does not end before the setup process, which would end the container.
+pub fn kill_runtime_processes(aj: &mut Child, setup: Pid) {
+    let runtime = Pid::from_raw(aj.id() as i32);
+    kill(runtime, Signal::SIGSTOP).unwrap();
+    kill(setup, Signal::SIGKILL).unwrap();
+    kill(runtime, Signal::SIGKILL).unwrap();
+    wait(aj);
+}
+
 /// The parent process of `pid`.
 pub fn parent_of(pid: Pid) -> Pid {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
