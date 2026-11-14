@@ -9,7 +9,7 @@ pub struct ContainerId(String);
 
 impl ContainerId {
     /// The ID is part of a systemd unit name, which may have at most 255 characters.
-    const MAX_LENGTH: usize = 128;
+    pub const MAX_LENGTH: usize = 128;
 
     /// Generate an ID of 16 lowercase hexadecimal digits.
     pub fn generate() -> Self {

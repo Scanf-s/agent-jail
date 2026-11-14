@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use super::RunArgs;
+use super::{RunArgs, SandboxCreateArgs};
 use crate::container_id::ContainerId;
 
 /// Top-level parsed CLI command.
@@ -62,6 +62,20 @@ pub enum Command {
         #[arg(value_parser = ContainerId::parse)]
         id: ContainerId,
     },
+    /// Manage sandboxes: environments whose installed files stay across commands.
+    Sandbox {
+        #[command(subcommand)]
+        command: SandboxCommand,
+    },
+}
+
+/// Subcommands of `aj sandbox`.
+#[derive(Subcommand, Debug)]
+pub enum SandboxCommand {
+    /// Create a sandbox: a record of its environment and empty directories for its files.
+    Create(SandboxCreateArgs),
+    /// List the sandboxes.
+    List,
 }
 
 #[cfg(test)]
@@ -238,6 +252,39 @@ mod tests {
         let cli = Cli::try_parse_from(["aj", "--root", "/state", "list"]).unwrap();
         assert!(matches!(cli.command, Command::List));
         assert_eq!(cli.root, Some(PathBuf::from("/state")));
+    }
+
+    #[test]
+    fn parses_sandbox_list() {
+        let cli = Cli::try_parse_from(["aj", "sandbox", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sandbox {
+                command: SandboxCommand::List
+            }
+        ));
+        assert!(Cli::try_parse_from(["aj", "sandbox"]).is_err());
+    }
+
+    #[test]
+    fn parses_sandbox_create() {
+        let cli = Cli::try_parse_from([
+            "aj", "sandbox", "create", "-v", "/src", "--env", "A=1", "--net", "none", "proj",
+        ])
+        .unwrap();
+        let Command::Sandbox {
+            command: SandboxCommand::Create(args),
+        } = cli.command
+        else {
+            panic!("expected sandbox create");
+        };
+        assert_eq!(args.name.as_str(), "proj");
+        assert_eq!(args.image, "default");
+        assert_eq!(args.volumes, ["/src"]);
+        assert_eq!(args.envs, ["A=1"]);
+        assert_eq!(args.net, NetworkMode::None);
+        assert!(Cli::try_parse_from(["aj", "sandbox", "create"]).is_err());
+        assert!(Cli::try_parse_from(["aj", "sandbox", "create", ".x"]).is_err());
     }
 
     #[test]

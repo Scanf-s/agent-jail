@@ -3,12 +3,14 @@ use super::subordinate::{
 };
 use anyhow::{Context, Result, bail};
 use nix::unistd::{Gid, Pid, Uid};
+use serde::{Deserialize, Serialize};
 use std::io;
 use std::process::Command;
 
 /// One line of a UID or GID map: `count` container IDs starting at `container_id` map to
 /// host IDs starting at `host_id`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IdRange {
     pub container_id: u32,
     pub host_id: u32,

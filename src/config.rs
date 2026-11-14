@@ -1,5 +1,6 @@
 use crate::cgroups::CgroupSettings;
 use crate::container_id::ContainerId;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -21,7 +22,8 @@ pub struct ContainerConfig {
 }
 
 /// How the container reaches the network.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     /// Outbound access through pasta. Host services that listen only on 127.0.0.1 stay
     /// unreachable, but services on other host addresses are reachable.
@@ -31,7 +33,8 @@ pub enum NetworkMode {
 }
 
 /// A host file or directory that the container sees at `destination`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Volume {
     /// Absolute host path without symbolic links.
     pub source: PathBuf,

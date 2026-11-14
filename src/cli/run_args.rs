@@ -1,7 +1,7 @@
 use super::env_arg::build_env;
 use super::volume_arg::{default_workdir, parse_volume};
 use crate::cgroups::{CgroupSettings, CpuMax};
-use crate::config::{ContainerConfig, NetworkMode, ProcessConfig};
+use crate::config::{ContainerConfig, NetworkMode, ProcessConfig, Volume};
 use crate::container_id::ContainerId;
 use crate::paths;
 use anyhow::{Context, Result, bail, ensure};
@@ -69,19 +69,7 @@ impl RunArgs {
             .iter()
             .map(|spec| parse_volume(spec))
             .collect::<Result<Vec<_>>>()?;
-        let cwd = match self.workdir {
-            Some(workdir) => {
-                ensure!(
-                    workdir.is_absolute(),
-                    "--workdir must be an absolute path inside the container but got {workdir:?}"
-                );
-                workdir
-            }
-            None => {
-                let host_cwd = std::env::current_dir().context("read the current directory")?;
-                default_workdir(&host_cwd, &volumes)
-            }
-        };
+        let cwd = resolve_workdir(self.workdir, &volumes)?;
 
         let env = build_env(&self.envs, |key| {
             std::env::var_os(key).map(|value| value.to_string_lossy().into_owned())
@@ -107,30 +95,53 @@ impl RunArgs {
     }
 
     fn validate(&self) -> Result<CgroupSettings> {
-        if !self.cpus.is_finite() || self.cpus <= 0.0 {
-            bail!("--cpus must be finite and positive but got {}", self.cpus);
-        }
+        resource_settings(self.cpus, self.mem, self.pids)
+    }
+}
 
-        let host_cpus = num_cpus::get() as f64;
-        if self.cpus > host_cpus {
-            bail!(
-                "--cpus must be less than or equal to `max_cpus`. you have only {} cpus available",
-                host_cpus
+/// The cgroup limits for `--cpus`, `--mem`, and `--pids`.
+pub(super) fn resource_settings(cpus: f64, mem: u64, pids: u64) -> Result<CgroupSettings> {
+    if !cpus.is_finite() || cpus <= 0.0 {
+        bail!("--cpus must be finite and positive but got {cpus}");
+    }
+
+    let host_cpus = num_cpus::get() as f64;
+    if cpus > host_cpus {
+        bail!(
+            "--cpus must be less than or equal to `max_cpus`. you have only {} cpus available",
+            host_cpus
+        );
+    }
+
+    let cpu_quota_us = (cpus * CpuMax::DEFAULT_PERIOD_US as f64) as u64;
+    let cpu_quota_us =
+        NonZeroU64::new(cpu_quota_us).context("--cpus is too small for a nonzero CPU quota")?;
+
+    Ok(CgroupSettings {
+        cpu: Some(CpuMax {
+            quota_us: cpu_quota_us,
+            period_us: CpuMax::DEFAULT_PERIOD_US,
+        }),
+        memory_max: Some(mem),
+        pids_max: Some(pids),
+    })
+}
+
+/// The working directory for `--workdir`, or the default for `volumes`: the host's current
+/// directory if a volume contains it, and `/` otherwise.
+pub(super) fn resolve_workdir(workdir: Option<PathBuf>, volumes: &[Volume]) -> Result<PathBuf> {
+    match workdir {
+        Some(workdir) => {
+            ensure!(
+                workdir.is_absolute(),
+                "--workdir must be an absolute path inside the container but got {workdir:?}"
             );
+            Ok(workdir)
         }
-
-        let cpu_quota_us = (self.cpus * CpuMax::DEFAULT_PERIOD_US as f64) as u64;
-        let cpu_quota_us =
-            NonZeroU64::new(cpu_quota_us).context("--cpus is too small for a nonzero CPU quota")?;
-
-        Ok(CgroupSettings {
-            cpu: Some(CpuMax {
-                quota_us: cpu_quota_us,
-                period_us: CpuMax::DEFAULT_PERIOD_US,
-            }),
-            memory_max: Some(self.mem),
-            pids_max: Some(self.pids),
-        })
+        None => {
+            let host_cwd = std::env::current_dir().context("read the current directory")?;
+            Ok(default_workdir(&host_cwd, volumes))
+        }
     }
 }
 

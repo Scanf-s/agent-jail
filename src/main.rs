@@ -15,6 +15,7 @@ mod container_id;
 mod descriptors;
 mod filesystem;
 mod flock;
+mod image;
 mod ipc;
 mod network;
 mod oci;
@@ -22,6 +23,7 @@ mod paths;
 mod pidfd;
 mod proc_stat;
 mod runtime;
+mod sandbox;
 mod signals;
 mod state;
 mod user;
@@ -70,6 +72,21 @@ fn main() -> Result<ExitCode> {
             print!("{}", state::table(&state::list(&state_root)?));
             Ok(ExitCode::SUCCESS)
         }
+        cli::Command::Sandbox { command } => match command {
+            cli::SandboxCommand::Create(args) => {
+                let mapping = user::Mapping::for_current_user()?;
+                let record = args.into_record(&mapping)?;
+                sandbox::create_in(&sandbox::sandboxes_dir()?, &record)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            cli::SandboxCommand::List => {
+                print!(
+                    "{}",
+                    sandbox::table(&sandbox::list_in(&sandbox::sandboxes_dir()?)?)
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         cli::Command::Delete { id, force } => {
             state::delete(&state_root, &id, force)?;
             // A setup process that was killed leaves the run directory of its container. The

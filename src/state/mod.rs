@@ -6,7 +6,7 @@ mod stale;
 
 pub use delete::delete;
 pub use dir::StateDir;
-pub use query::{list, read, table};
+pub use query::{list, local_time, read, table};
 pub use record::Record;
 pub use stale::remove_stale;
 

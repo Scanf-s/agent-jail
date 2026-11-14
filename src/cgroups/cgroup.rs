@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{AccessFlags, Pid, access};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::num::NonZeroU64;
@@ -167,6 +168,8 @@ fn kill_listed_processes(dir: &Path) -> Result<()> {
 }
 
 // Resource limits for the container's cgroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CgroupSettings {
     pub cpu: Option<CpuMax>,
     /// RAM limit in bytes. Setting it also stops the container from using swap.
@@ -175,6 +178,8 @@ pub struct CgroupSettings {
 }
 
 // CPU time the cgroup may use, in microseconds, within each period.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CpuMax {
     pub quota_us: NonZeroU64,
     pub period_us: u64,

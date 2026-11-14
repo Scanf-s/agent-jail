@@ -132,7 +132,7 @@ pub fn table(records: &[Record]) -> String {
 }
 
 /// `seconds` after the Unix epoch as local time, in the form `2026-11-11 14:12:30`.
-fn local_time(seconds: u64) -> String {
+pub fn local_time(seconds: u64) -> String {
     let Ok(time) = libc::time_t::try_from(seconds) else {
         return seconds.to_string();
     };
