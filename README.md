@@ -37,6 +37,9 @@ Run these commands in the project directory.
    ./scripts/fetch-rootfs.sh
    ```
 
+   The script checks the download against a fixed checksum and stores it in `~/.local/share/agent-jail/images/sha256-<checksum>`.
+   `images/default` links to it.
+
 3. Start a shell.
 
    ```bash
