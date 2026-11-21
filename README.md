@@ -44,7 +44,7 @@ cargo build --release
 3. Run the binary with `sudo`.
 
 ```bash
-sudo ./target/release/container-runtime run ./rootfs \
+sudo ./target/release/mini-container run ./rootfs \
   --cpus 1.0 --mem 536870912 --pids 1024 \
   --uid "$(id -u)" --gid "$(id -g)" /bin/sh
 ```
