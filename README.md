@@ -3,6 +3,16 @@
 This repository contains a study-purpose container runtime written in Rust.
 It isolates the filesystem, processes, network, user namespace, and hardware resources.
 
+## How a container starts
+
+The diagram shows the steps that the `run` command takes before it executes the command inside the container.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/container-startup-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/container-startup-light.png">
+  <img alt="Sequence diagram of how the run command starts a container" src="assets/container-startup-light.png">
+</picture>
+
 ## Requirements
 
 This project only runs on Linux. It uses namespaces, cgroup v2, `pivot_root`, and privileged `mount` calls.
