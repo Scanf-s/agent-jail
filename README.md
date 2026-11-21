@@ -16,6 +16,7 @@ The diagram shows the steps that the `run` command takes before it executes the 
 ## Requirements
 
 This project only runs on Linux. It uses namespaces, cgroup v2, `pivot_root`, and privileged `mount` calls.
+On macOS, run it inside a Lima VM. See [Run on macOS through a Lima VM](#run-on-macos-through-a-lima-vm).
 
 - A Linux host with cgroup v2 mounted in unified mode. Run `stat -fc %T /sys/fs/cgroup`, and the output must be `cgroup2fs`. Debian 11 and later, and Ubuntu 22.04 and later, use cgroup v2 by default.
 - Root privileges. The runtime writes to `/sys/fs/cgroup`, and it also calls `mount` and `pivot_root`.
@@ -52,6 +53,30 @@ Two notes about this command:
 
 - Avoid `sudo cargo run` when you installed Rust with `rustup`. The root PATH usually does not include `~/.cargo/bin`, so the command fails. Build first, then run the produced binary with `sudo`.
 - `--uid` and `--gid` set the host user that container root maps to. `$(id -u)` and `$(id -g)` map it to yourself, so files created inside the container stay writable for you.
+
+### Run on macOS through a Lima VM
+
+macOS does not have the Linux kernel features that this runtime needs.
+`scripts/lima.sh` runs the runtime inside the Lima VM that `lima/mini-container.yaml` defines.
+
+1. Install Lima 2.0 or later.
+
+```bash
+brew install lima
+```
+
+2. Fetch the rootfs into the VM. The first call creates and starts a VM named `mini-container`, so it takes a few minutes.
+
+```bash
+./scripts/lima.sh rootfs
+```
+
+3. Run a command in a container. The script builds the binary inside the VM before each run.
+
+```bash
+./scripts/lima.sh run /opt/mini-container/rootfs \
+  --cpus 1.0 --mem 536870912 --pids 1024 /bin/sh
+```
 
 ### Development commands
 

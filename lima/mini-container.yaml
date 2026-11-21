@@ -1,0 +1,24 @@
+# Linux VM that scripts/lima.sh uses to run mini-container on macOS.
+minimumLimaVersion: 2.0.0
+
+# Same image and mounts as Lima's default template: Ubuntu, with the macOS home
+# directory mounted read-only at the same path.
+base:
+- template:_images/ubuntu
+- template:_default/mounts
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    command -v cc >/dev/null && exit 0
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y build-essential ca-certificates curl
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    [ -x "$HOME/.cargo/bin/cargo" ] && exit 0
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
