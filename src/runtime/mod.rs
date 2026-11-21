@@ -2,19 +2,25 @@ use crate::cgroups::Cgroup;
 use crate::config::ContainerConfig;
 use crate::container;
 use crate::filesystem::PivotRoot;
-use crate::ipc::StartupChannels;
 use crate::user::Mapping;
 use anyhow::{Context, Result, bail};
 use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, fork, setgid, setuid};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
+
+const CGROUP_READY: u8 = 1;
+const USER_NAMESPACE_READY: u8 = 2;
+const MAPPING_READY: u8 = 3;
 
 pub struct Runtime {
     config: ContainerConfig,
     cgroup: Cgroup,
-    channels: Option<StartupChannels>,
+    parent_end: Option<UnixStream>,
+    child_end: Option<UnixStream>,
 }
 
 impl Runtime {
@@ -23,12 +29,13 @@ impl Runtime {
         cgroup.configure(&config.resources)?;
 
         // ipc setup for the parent and the child process communication
-        let channels = StartupChannels::new()?;
+        let (parent_end, child_end) = UnixStream::pair()?;
 
         Ok(Self {
             config,
             cgroup,
-            channels: Some(channels),
+            parent_end: Some(parent_end),
+            child_end: Some(child_end),
         })
     }
 
@@ -40,7 +47,10 @@ impl Runtime {
     }
 
     fn run_parent(&mut self, child: Pid) -> Result<ExitCode> {
-        if let Err(error) = self.setup_parent(child) {
+        drop(self.child_end.take());
+        let mut stream = self.parent_end.take().context("parent_end already used")?;
+
+        if let Err(error) = self.setup_parent(child, &mut stream) {
             let _ = kill(child, Signal::SIGKILL);
             let _ = waitpid(child, None);
             return Err(error).context("container setup failed; child killed");
@@ -50,21 +60,17 @@ impl Runtime {
         Ok(ExitCode::from(exit_status(status)?))
     }
 
-    fn setup_parent(&mut self, child: Pid) -> Result<()> {
-        let channels = self
-            .channels
-            .take()
-            .context("startup channels already used")?;
-        let mut ipc = channels.for_parent();
-
+    fn setup_parent(&mut self, child: Pid, stream: &mut UnixStream) -> Result<()> {
         // The setup process waits until it belongs to the cgroup.
         self.cgroup
             .add_pid(child)
             .context("add setup child to cgroup")?;
-        ipc.signal_cgroup_ready()?;
+        stream
+            .write_all(&[CGROUP_READY])
+            .context("send cgroup ready")?;
 
         // UID/GID maps can be written after the child creates its user namespace.
-        ipc.wait_for_user_namespace()?;
+        expect(stream, USER_NAMESPACE_READY, "user namespace")?;
         Mapping::new(
             child,
             Uid::from_raw(self.config.id_mapping.host_uid),
@@ -72,7 +78,9 @@ impl Runtime {
         )
         .map()
         .context("map container UID/GID")?;
-        ipc.signal_mapping_ready()?;
+        stream
+            .write_all(&[MAPPING_READY])
+            .context("send mapping ready")?;
         Ok(())
     }
 
@@ -85,18 +93,18 @@ impl Runtime {
     }
 
     fn setup_process(&mut self) -> Result<()> {
-        let channels = self
-            .channels
-            .take()
-            .context("startup channels already used")?;
-        let mut ipc = channels.for_child();
-        ipc.wait_for_cgroup()?;
+        drop(self.parent_end.take());
+        let mut stream = self.child_end.take().context("child_end already used")?;
+        expect(&mut stream, CGROUP_READY, "cgroup")?;
 
         // call unshare to isolate the user namespace
         unshare(CloneFlags::CLONE_NEWUSER).context("unshare(CLONE_NEWUSER)")?;
-        ipc.signal_user_namespace_ready()?;
+        stream
+            .write_all(&[USER_NAMESPACE_READY])
+            .context("send user namespace ready")?;
 
-        ipc.wait_for_mapping()?;
+        expect(&mut stream, MAPPING_READY, "mapping")?;
+        drop(stream);
         self.launch_init()
     }
 
@@ -139,5 +147,56 @@ fn exit_status(status: WaitStatus) -> Result<u8> {
         WaitStatus::Exited(_, code) => Ok(code as u8),
         WaitStatus::Signaled(_, signal, _) => Ok(128 + signal as u8),
         other => bail!("unexpected wait status: {other:?}"),
+    }
+}
+
+fn expect(stream: &mut UnixStream, expected: u8, stage: &str) -> Result<()> {
+    let mut byte = [0u8; 1];
+    stream
+        .read_exact(&mut byte)
+        .with_context(|| format!("wait for {stage}"))?;
+    if byte[0] != expected {
+        bail!("unexpected {stage} message: {}", byte[0]);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expect_accepts_the_expected_message() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&[CGROUP_READY]).unwrap();
+
+        expect(&mut reader, CGROUP_READY, "cgroup").unwrap();
+    }
+
+    #[test]
+    fn expect_rejects_an_unexpected_message() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&[MAPPING_READY]).unwrap();
+
+        let error = expect(&mut reader, CGROUP_READY, "cgroup").unwrap_err();
+        assert!(error.to_string().contains("unexpected cgroup message: 3"));
+    }
+
+    #[test]
+    fn expect_fails_when_peer_closes_before_sending() {
+        let (mut reader, writer) = UnixStream::pair().unwrap();
+        drop(writer);
+
+        let error = expect(&mut reader, CGROUP_READY, "cgroup").unwrap_err();
+        assert!(error.to_string().contains("wait for cgroup"));
+    }
+
+    #[test]
+    fn expect_reads_buffered_messages_one_at_a_time() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(&[CGROUP_READY, MAPPING_READY]).unwrap();
+
+        expect(&mut reader, CGROUP_READY, "cgroup").unwrap();
+        expect(&mut reader, MAPPING_READY, "mapping").unwrap();
     }
 }
