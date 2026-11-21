@@ -19,7 +19,7 @@ This project only runs on Linux. It uses namespaces, cgroup v2, `pivot_root`, an
 
 - A Linux host with cgroup v2 mounted in unified mode. Run `stat -fc %T /sys/fs/cgroup`, and the output must be `cgroup2fs`. Debian 11 and later, and Ubuntu 22.04 and later, use cgroup v2 by default.
 - Root privileges. The runtime writes to `/sys/fs/cgroup`, and it also calls `mount` and `pivot_root`.
-- A Rust toolchain that supports edition 2024, so Rust 1.85 or newer. The project was last checked with Rust 1.98.1.
+- A Rust toolchain that supports edition 2024, so Rust 1.85 or newer. The project was last checked with Rust 1.100.0.
 - `curl` and `tar`, because `scripts/fetch-rootfs.sh` downloads and extracts an Alpine minirootfs.
 
 ## How to run
